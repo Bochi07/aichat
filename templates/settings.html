@@ -1,0 +1,83 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover">
+<title>设置 - 个人学习实验台</title>
+<link rel="stylesheet" href="static/style.css">
+</head>
+<body class="settings-page">
+<div class="settings-container">
+    <header class="settings-header">
+        <a href="./" class="btn btn-back">← 返回</a>
+        <h1>设置</h1>
+    </header>
+
+    <div class="settings-section">
+        <h2>访问密钥</h2>
+        <div style="display:flex;gap:8px;margin-bottom:10px">
+            <select id="provider-pick" class="model-select" style="min-width:110px"></select>
+            <input type="text" id="key-input" class="input" style="flex:1;font-size:14px" placeholder="输入访问密钥..." autocomplete="off">
+            <button class="btn btn-sm" onclick="saveKey()" style="background:var(--primary);color:#fff;white-space:nowrap">保存</button>
+        </div>
+        <div id="key-status" style="font-size:13px;color:#94a3b8;margin-top:6px"></div>
+        <div id="key-detail" style="display:none;margin-top:8px;padding:8px 12px;background:#f0fdf4;border-radius:8px;font-size:13px">
+            <span id="key-provider-name"></span>
+            <span id="key-full" style="font-family:monospace;word-break:break-all;display:block;margin-top:4px;color:#166534"></span>
+            <button class="btn btn-sm" onclick="deleteCurKey()" style="margin-top:6px;background:#ef4444;color:#fff">删除此密钥</button>
+        </div>
+    </div>
+
+    <div class="settings-section">
+        <h2>账号</h2>
+        <div style="display:flex;justify-content:space-between;padding:8px 0;font-size:14px">
+            <span style="color:#94a3b8">用户名</span><span id="account-name" style="font-weight:500">-</span>
+        </div>
+        <hr style="border:none;border-top:1px solid #e2e8f0;margin:8px 0">
+        <form id="pwd-form" onsubmit="changePassword(event)" style="display:flex;flex-direction:column;gap:10px">
+            <input type="password" id="new-password" class="input" placeholder="新密码" required>
+            <button type="submit" class="btn btn-primary">修改密码</button>
+        </form>
+        <div id="pwd-msg"></div>
+    </div>
+
+    <div class="settings-section" style="border:1px solid #fecaca">
+        <h2 style="color:#dc2626">注销账号</h2>
+        <p style="font-size:13px;color:#94a3b8;margin-bottom:8px">输入「确认注销此账号」确认</p>
+        <form id="del-form" onsubmit="deleteAccount(event)" style="display:flex;flex-direction:column;gap:10px">
+            <input type="text" id="del-confirm" class="input" placeholder="确认注销此账号" required autocomplete="off">
+            <button type="submit" class="btn btn-danger" id="btn-del" disabled>注销账号</button>
+        </form>
+        <div id="del-msg"></div>
+    </div>
+</div>
+
+<script>
+const PROVIDER_IDS=['deepseek','qwen','ernie','mimo'];
+let PROVIDER_INFO={},keysData={},curProvider=null;
+
+async function loadInfo(){
+    const[provResp,keysResp,meResp]=await Promise.all([fetch('api/providers'),fetch('api/keys'),fetch('api/auth/me')]);
+    PROVIDER_INFO=await provResp.json();keysData=await keysResp.json();
+    for(const pid of PROVIDER_IDS){if(keysData[pid]&&keysData[pid].has_key){curProvider=pid;break;}}
+    document.getElementById('provider-pick').innerHTML=PROVIDER_IDS.map(pid=>`<option value="${pid}" ${pid===curProvider?'selected':''}>${(PROVIDER_INFO[pid]||{}).name||pid}</option>`).join('');
+    updateStatus();
+    if(curProvider){showDetail(curProvider);document.getElementById('key-input').style.display='none';document.querySelector('#provider-pick').parentElement.querySelector('.btn').style.display='none';}
+    document.getElementById('account-name').textContent=meResp.ok?(await meResp.json()).username:'已登录';
+}
+function updateStatus(){
+    const parts=PROVIDER_IDS.map(pid=>{const n=(PROVIDER_INFO[pid]||{}).name||pid;return keysData[pid]&&keysData[pid].has_key?n+' ✅':'';}).filter(Boolean);
+    document.getElementById('key-status').textContent=parts.length?'已配置：'+parts.join(' | '):'暂未配置访问密钥';
+}
+function showDetail(pid){document.getElementById('key-detail').style.display='block';document.getElementById('key-provider-name').textContent=(PROVIDER_INFO[pid]||{}).name||pid;document.getElementById('key-full').textContent=keysData[pid]?keysData[pid].api_key:'';}
+async function saveKey(){const pid=document.getElementById('provider-pick').value,api_key=document.getElementById('key-input').value.trim();if(!api_key)return alert('请输入访问密钥');const resp=await fetch('api/keys',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({provider:pid,api_key})});if(resp.ok){alert('已保存');location.reload();}else alert((await resp.json()).detail||'失败');}
+async function deleteCurKey(){if(!curProvider||!confirm('确定删除此访问密钥？'))return;await fetch('api/keys/'+curProvider,{method:'DELETE'});location.reload();}
+
+async function changePassword(e){e.preventDefault();const pwd=document.getElementById('new-password').value.trim();if(!pwd)return;const msg=document.getElementById('pwd-msg'),resp=await fetch('api/auth/password',{method:'PUT',headers:{'Content-Type':'application/json'},body:JSON.stringify({password:pwd})}),data=await resp.json();msg.style.display='block';msg.style.fontSize='13px';msg.style.marginTop='6px';msg.style.color=resp.ok?'#16a34a':'#dc2626';msg.textContent=data.message||data.detail||'失败';if(resp.ok)document.getElementById('new-password').value='';}
+
+document.getElementById('del-confirm').addEventListener('input',function(){document.getElementById('btn-del').disabled=this.value.trim()!=='确认注销此账号';});
+async function deleteAccount(e){e.preventDefault();const c=document.getElementById('del-confirm').value.trim();if(c!=='确认注销此账号')return;if(!confirm('不可撤销！'))return;const msg=document.getElementById('del-msg'),resp=await fetch('api/auth/account',{method:'DELETE',headers:{'Content-Type':'application/json'},body:JSON.stringify({confirm:c})}),data=await resp.json();msg.style.display='block';msg.style.fontSize='13px';msg.style.marginTop='6px';if(resp.ok){msg.style.color='#16a34a';msg.textContent='已注销，即将跳转...';setTimeout(()=>{window.location.href='login';},1500);}else{msg.style.color='#dc2626';msg.textContent=data.detail||'失败';}}
+loadInfo();
+</script>
+</body>
+</html>

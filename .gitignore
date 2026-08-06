@@ -1,0 +1,46 @@
+# ============================================================
+# 个人学习实验台 - Git 忽略规则
+# ============================================================
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.egg-info/
+dist/
+build/
+
+# 环境变量（含 SECRET_KEY，绝对不能提交）
+.env
+
+# 数据库（含用户数据和 API Key）
+data.db
+*.sqlite
+*.sqlite3
+data/
+
+# 虚拟环境
+.venv/
+venv/
+env/
+.venv
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# 系统文件
+.DS_Store
+Thumbs.db
+
+# 备份文件
+*.bak
+*.backup
+
+# 日志
+*.log
+gunicorn.pid
+uwsgi.pid

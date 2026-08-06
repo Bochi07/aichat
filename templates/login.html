@@ -1,0 +1,100 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover">
+<title>个人学习实验台 - 登录</title>
+<link rel="stylesheet" href="static/style.css">
+</head>
+<body class="auth-page">
+<div class="auth-container">
+    <div class="auth-card">
+        <h1 class="auth-title">个人学习实验台</h1>
+        <p class="auth-subtitle">个人学习空间</p>
+
+        <div id="error-msg" class="error-msg" style="display:none"></div>
+
+        <!-- 登录表单 -->
+        <form id="login-form" class="auth-form" onsubmit="handleLogin(event)">
+            <input type="text" name="username" placeholder="用户名" required autocomplete="username" class="input">
+            <input type="password" name="password" placeholder="密码" required autocomplete="current-password" class="input">
+            <button type="submit" class="btn btn-primary">登录</button>
+        </form>
+
+        <!-- 注册表单 -->
+        <form id="signup-form" class="auth-form" style="display:none" onsubmit="handleSignup(event)">
+            <input type="text" name="username" placeholder="用户名" required autocomplete="username" class="input" maxlength="30">
+            <input type="password" name="password" placeholder="密码" required autocomplete="new-password" class="input">
+            <div class="captcha-row">
+                <span class="captcha-question" id="captcha-question">加载中...</span>
+                <input type="text" name="captcha_answer" placeholder="答案" required class="input captcha-input" maxlength="2" autocomplete="off" inputmode="numeric">
+                <button type="button" class="btn btn-sm captcha-refresh" onclick="refreshCaptcha()">换一题</button>
+            </div>
+            <input type="hidden" name="captcha_signed" id="captcha-signed">
+            <input type="text" name="honey" class="honey" tabindex="-1" autocomplete="off">
+            <button type="submit" class="btn btn-primary">注册</button>
+        </form>
+
+        <p class="auth-toggle">
+            <span id="toggle-text">没有账号？</span>
+            <a href="#" onclick="toggleMode()" id="toggle-link">立即注册</a>
+        </p>
+    </div>
+</div>
+
+<script>
+let mode = 'login';
+
+function toggleMode() {
+    mode = mode === 'login' ? 'signup' : 'login';
+    document.getElementById('login-form').style.display = mode === 'login' ? 'flex' : 'none';
+    document.getElementById('signup-form').style.display = mode === 'signup' ? 'flex' : 'none';
+    document.getElementById('toggle-text').textContent = mode === 'login' ? '没有账号？' : '已有账号？';
+    document.getElementById('toggle-link').textContent = mode === 'login' ? '立即注册' : '去登录';
+    document.getElementById('error-msg').style.display = 'none';
+    if (mode === 'signup') refreshCaptcha();
+}
+
+async function refreshCaptcha() {
+    try {
+        const resp = await fetch('api/auth/captcha');
+        const data = await resp.json();
+        document.getElementById('captcha-question').textContent = data.question;
+        document.getElementById('captcha-signed').value = data.signed;
+    } catch(e) {
+        document.getElementById('captcha-question').textContent = '加载失败';
+    }
+}
+
+function showError(msg) {
+    const el = document.getElementById('error-msg');
+    el.textContent = msg;
+    el.style.display = 'block';
+    setTimeout(() => el.style.display = 'none', 4000);
+}
+
+async function handleLogin(e) {
+    e.preventDefault();
+    const fd = new FormData(e.target);
+    try {
+        const resp = await fetch('api/auth/login', { method: 'POST', body: fd });
+        const data = await resp.json();
+        if (resp.ok) { window.location.href = './'; }
+        else { showError(data.detail || '登录失败'); }
+    } catch(err) { showError('网络错误'); }
+}
+
+async function handleSignup(e) {
+    e.preventDefault();
+    const fd = new FormData(e.target);
+    if (!fd.get('captcha_answer')) { showError('请输入验证码'); return; }
+    try {
+        const resp = await fetch('api/auth/signup', { method: 'POST', body: fd });
+        const data = await resp.json();
+        if (resp.ok) { window.location.href = './'; }
+        else { showError(data.detail || '注册失败'); refreshCaptcha(); }
+    } catch(err) { showError('网络错误'); }
+}
+</script>
+</body>
+</html>

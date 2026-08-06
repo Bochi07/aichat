@@ -1,0 +1,10 @@
+services:
+  aichat:
+    build: .
+    ports:
+      - "3210:3210"
+    volumes:
+      - ./data:/app/data
+    environment:
+      - SECRET_KEY=请改成随机字符串至少32位
+    restart: unless-stopped

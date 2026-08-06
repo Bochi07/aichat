@@ -1,0 +1,260 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover">
+<title>个人学习实验台</title>
+<link rel="stylesheet" href="static/style.css">
+</head>
+<body class="chat-page">
+<div class="app-container">
+    <aside class="sidebar" id="sidebar">
+        <div class="sidebar-header">
+            <span class="sidebar-title">记录列表</span>
+            <button class="btn-icon" onclick="toggleSidebar()">✕</button>
+        </div>
+        <button class="btn btn-new-chat" onclick="newChat()">+ 新建实验</button>
+        <input type="text" id="search-input" class="search-input" placeholder="搜索记录..." autocomplete="off" oninput="onSearch()">
+        <div class="chat-list" id="chat-list"></div>
+        <div class="sidebar-footer">
+            <a href="settings" class="sidebar-link">⚙ 设置</a>
+            <a href="#" onclick="logout()" class="sidebar-link">退出登录</a>
+        </div>
+    </aside>
+    <div class="sidebar-overlay" id="sidebar-overlay" onclick="toggleSidebar()"></div>
+
+    <main class="main-area">
+        <header class="chat-header">
+            <button class="btn-icon menu-btn" onclick="toggleSidebar()">☰</button>
+            <span class="chat-title" id="chat-title" onclick="renameCurrentChat()" title="点击修改名称">个人学习实验台</span>
+            <button class="btn-icon" onclick="deleteChat()" id="btn-delete" style="display:none">🗑</button>
+        </header>
+        <div class="model-bar">
+            <select id="provider-select" class="model-select" onchange="onProviderChange()"></select>
+            <select id="model-select" class="model-select" onchange="savePrefs()"></select>
+            <label class="think-toggle" id="think-label">
+                <input type="checkbox" id="deep-think" onchange="savePrefs()"> 深度分析
+            </label>
+        </div>
+        <div class="system-prompt-bar">
+            <div class="sp-header" onclick="toggleSystemPrompt()"><span>🎭 实验参数</span><span id="sp-toggle">展开</span></div>
+            <div class="sp-body" id="sp-body" style="display:none">
+                <textarea id="system-prompt-input" class="input" rows="3" placeholder="设定实验参数..."></textarea>
+                <button class="btn btn-sm" onclick="saveSystemPrompt()">保存参数</button>
+            </div>
+        </div>
+        <div class="messages-container" id="messages">
+            <div class="empty-state"><div class="empty-icon">💬</div><p>开始新实验</p></div>
+        </div>
+        <div class="input-area">
+            <form class="input-form" onsubmit="sendMessage(event)" id="msg-form">
+                <input type="text" id="msg-input" class="input chat-input" placeholder="输入内容..." autocomplete="off" required enterkeyhint="send">
+                <button type="submit" class="btn btn-send" id="btn-send">运行</button>
+                <button type="button" class="btn btn-stop" id="btn-stop" style="display:none" onclick="stopStream()">中止</button>
+            </form>
+        </div>
+    </main>
+</div>
+
+<script>
+let currentChatId=null,abortController=null,currentMessageIds={},searchTimer=null;
+let sidebarOpen=!window.matchMedia('(max-width:1023px)').matches;
+const PROVIDER_LIST=['deepseek','qwen','ernie','mimo'];
+let PROVIDERS={},providerModels={};
+
+async function loadProviders(){
+    const resp=await fetch('api/providers');
+    PROVIDERS=await resp.json();
+    const sel=document.getElementById('provider-select');
+    sel.innerHTML=PROVIDER_LIST.map(p=>`<option value="${p}">${(PROVIDERS[p]||{}).name||p}</option>`).join('');
+    const saved=localStorage.getItem('provider')||'deepseek';
+    sel.value=saved in PROVIDERS?saved:'deepseek';
+    onProviderChange(false);
+    const m=localStorage.getItem('model');
+    if(m&&providerModels[saved]&&providerModels[saved].includes(m))document.getElementById('model-select').value=m;
+    document.getElementById('deep-think').checked=localStorage.getItem('deepThink')==='true';
+    document.getElementById('think-label').style.display=(sel.value==='deepseek'||sel.value==='mimo'||sel.value==='qwen')?'':'none';
+}
+function onProviderChange(save=true){
+    const pid=document.getElementById('provider-select').value;
+    providerModels=PROVIDERS[pid]?PROVIDERS[pid].models:[];
+    const def=PROVIDERS[pid]?PROVIDERS[pid].default_model:providerModels[0]||'';
+    const sel=document.getElementById('model-select');
+    sel.innerHTML=providerModels.map(m=>`<option value="${m}">${m}</option>`).join('');
+    sel.value=localStorage.getItem('model')&&providerModels.includes(localStorage.getItem('model'))?localStorage.getItem('model'):def;
+    document.getElementById('think-label').style.display=(pid==='deepseek'||pid==='mimo'||pid==='qwen')?'':'none';
+    if(save)savePrefs();
+}
+function savePrefs(){localStorage.setItem('provider',document.getElementById('provider-select').value);localStorage.setItem('model',document.getElementById('model-select').value);localStorage.setItem('deepThink',document.getElementById('deep-think').checked);}
+loadProviders();loadChats();applySidebarState();
+
+function applySidebarState(){
+    document.getElementById('sidebar').classList.toggle('open',sidebarOpen);
+    document.getElementById('sidebar-overlay').classList.toggle('show',sidebarOpen&&window.matchMedia('(max-width:1023px)').matches);
+}
+function toggleSidebar(){sidebarOpen=!sidebarOpen;applySidebarState();}
+window.matchMedia('(max-width:1023px)').addEventListener('change',e=>{sidebarOpen=!e.matches;applySidebarState();});
+
+let touchStartX=0;
+document.addEventListener('touchstart',e=>{touchStartX=e.touches[0].clientX},{passive:true});
+document.addEventListener('touchend',e=>{
+    const dx=e.changedTouches[0].clientX-touchStartX;
+    if(dx>60&&touchStartX<30&&!sidebarOpen){sidebarOpen=true;applySidebarState();}
+    if(dx<-60&&sidebarOpen&&window.matchMedia('(max-width:1023px)').matches){sidebarOpen=false;applySidebarState();}
+},{passive:true});
+
+function onSearch(){clearTimeout(searchTimer);searchTimer=setTimeout(()=>loadChats(),300);}
+async function loadChats(){
+    const q=document.getElementById('search-input')?document.getElementById('search-input').value.trim():'';
+    const resp=await fetch('api/chats'+(q?'?search='+encodeURIComponent(q):''));
+    const chats=await resp.json();
+    document.getElementById('chat-list').innerHTML=chats.map(c=>`<div class="chat-item ${c.id===currentChatId?'active':''}" onclick="selectChat(${c.id},${c.hit_msg_id||0})"><div class="chat-item-row"><span class="chat-item-title" id="ctitle-${c.id}">${escHtml(c.title)}</span><button class="chat-item-edit" onclick="event.stopPropagation();event.preventDefault();startRename(${c.id})" title="修改名称">✎</button></div>${c.hit_snippet?`<span class="chat-item-snippet">${escHtml(c.hit_snippet.slice(0,80))}</span>`:''}<span class="chat-item-date">${formatDate(c.updated_at)}</span></div>`).join('')||'<div class="empty-chats">暂无记录</div>';
+}
+
+function newChat(){
+    currentChatId=null;currentMessageIds={};
+    document.getElementById('chat-title').textContent='新实验';
+    document.getElementById('btn-delete').style.display='none';
+    document.getElementById('messages').innerHTML='<div class="empty-state"><div class="empty-icon">💬</div><p>开始新实验</p></div>';
+    document.getElementById('system-prompt-input').value='';
+    document.getElementById('sp-body').style.display='block';
+    document.getElementById('sp-toggle').textContent='收起';
+    document.getElementById('msg-input').focus();
+    if(window.matchMedia('(max-width:1023px)').matches)toggleSidebar();
+}
+
+async function selectChat(id,msgId){
+    currentChatId=id;currentMessageIds={};
+    const[msgsResp,chatsResp]=await Promise.all([fetch('api/chats/'+id+'/messages'),fetch('api/chats')]);
+    const msgs=await msgsResp.json();
+    const chat=(await chatsResp.json()).find(c=>c.id===id);
+    document.getElementById('chat-title').textContent=chat?chat.title:'实验';
+    document.getElementById('btn-delete').style.display='inline-block';
+    document.getElementById('system-prompt-input').value=chat?chat.system_prompt:'';
+    const el=document.getElementById('messages');
+    el.innerHTML=msgs.length?msgs.map(m=>renderMessage(m)).join(''):'<div class="empty-state"><p>开始实验吧</p></div>';
+    scrollToBottom(false);
+    if(msgId){setTimeout(()=>{const t=document.getElementById('msg-'+msgId);if(t){t.scrollIntoView({behavior:'smooth',block:'center'});t.classList.add('highlight');setTimeout(()=>t.classList.remove('highlight'),2000);}},200);}
+    loadChats();
+    if(window.matchMedia('(max-width:1023px)').matches)toggleSidebar();
+}
+
+function renderMessage(m){
+    const domId='msg-'+m.id;currentMessageIds[domId]=m.id;
+    const hasR=m.role==='assistant'&&m.reasoning&&m.reasoning.trim();
+    return`<div class="message ${m.role}" id="${domId}"><div class="msg-header"><span class="msg-role">${m.role==='user'?'我':'助手'}</span><button class="msg-del" onclick="deleteMessage(${m.id},'${domId}')">✕</button></div>${hasR?`<div class="msg-reasoning collapsed"><div class="reasoning-bar" onclick="this.parentElement.classList.toggle('collapsed')"><span>分析过程</span><span class="reasoning-arrow">▾</span></div><div class="reasoning-body">${escHtml(m.reasoning)}</div></div>`:''}<div class="msg-content">${escHtml(m.content).replace(/\n/g,'<br>')}</div><button class="msg-copy" onclick="copyMsg(event)" title="复制"><svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg></button></div>`;
+}
+
+async function deleteChat(){if(!currentChatId||!confirm('确定删除此记录？'))return;await fetch('api/chats/'+currentChatId,{method:'DELETE'});currentChatId=null;document.getElementById('chat-title').textContent='个人学习实验台';document.getElementById('btn-delete').style.display='none';document.getElementById('messages').innerHTML='<div class="empty-state"><p>记录已删除</p></div>';loadChats();}
+async function deleteMessage(msgId,domId){if(!confirm('删除这条记录？'))return;const resp=await fetch('api/messages/'+msgId,{method:'DELETE'});if(resp.ok){document.getElementById(domId)&&document.getElementById(domId).remove();delete currentMessageIds[domId];if(!document.querySelectorAll('#messages .message').length)document.getElementById('messages').innerHTML='<div class="empty-state"><p>开始实验吧</p></div>';}}
+
+function toggleSystemPrompt(){const b=document.getElementById('sp-body');b.style.display=b.style.display==='none'?'block':'none';document.getElementById('sp-toggle').textContent=b.style.display==='none'?'展开':'收起';}
+async function saveSystemPrompt(){
+    const sp=document.getElementById('system-prompt-input').value.trim();
+    if(!currentChatId){
+        const resp=await fetch('api/chats',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({title:sp.slice(0,30)||'新实验',system_prompt:sp})});
+        const data=await resp.json();currentChatId=data.id;
+        document.getElementById('chat-title').textContent=sp.slice(0,30)||'新实验';
+        document.getElementById('btn-delete').style.display='inline-block';loadChats();
+    }else{await fetch('api/chats/'+currentChatId,{method:'PUT',headers:{'Content-Type':'application/json'},body:JSON.stringify({system_prompt:sp})});}
+    document.getElementById('msg-input').focus();
+}
+
+async function sendMessage(e){
+    e.preventDefault();
+    const input=document.getElementById('msg-input'),message=input.value.trim();
+    if(!message)return;
+    const provider=document.getElementById('provider-select').value;
+    const model=document.getElementById('model-select').value;
+    const deepThink=(provider==='deepseek'||provider==='mimo'||provider==='qwen')&&document.getElementById('deep-think').checked;
+
+    if(!currentChatId){
+        const sp=document.getElementById('system-prompt-input').value.trim();
+        const resp=await fetch('api/chats',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({title:message.slice(0,30),system_prompt:sp})});
+        currentChatId=(await resp.json()).id;
+        document.getElementById('chat-title').textContent=message.slice(0,30);
+        document.getElementById('btn-delete').style.display='inline-block';loadChats();
+    }
+    input.value='';setSendState(true);
+    const userDomId=appendMessage('user',message);
+    const aiDomId=appendMessage('assistant','');
+    abortController=new AbortController();
+    try{
+        const resp=await fetch('api/chats/'+currentChatId+'/send',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({message,provider,model,deep_thinking:deepThink}),signal:abortController.signal});
+        const reader=resp.body.getReader(),decoder=new TextDecoder();
+        let buffer='',hasReasoning=false,lastScroll=0;
+        while(true){const{done,value}=await reader.read();if(done)break;buffer+=decoder.decode(value,{stream:true});
+            for(const line of buffer.split('\n')){if(!line.startsWith('data: '))continue;buffer='';const chunk=line.slice(6);if(chunk==='[DONE]')break;
+                try{const d=JSON.parse(chunk);if(d.error)updateMessage(aiDomId,'❌ '+d.error);else if(d.reasoning&&deepThink){hasReasoning=true;appendReasoning(aiDomId,d.reasoning);}else if(d.content)appendContent(aiDomId,d.content);const now=Date.now();if(now-lastScroll>80){lastScroll=now;scrollToBottom(true);}}catch(_){}}
+        }
+        scrollToBottom(false);
+        if(hasReasoning){const r=document.getElementById(aiDomId)&&document.getElementById(aiDomId).querySelector('.msg-reasoning');if(r)r.classList.add('collapsed');}
+    }catch(err){if(err.name!=='AbortError')updateMessage(aiDomId,'❌ '+err.message);}
+    abortController=null;setSendState(false);await refreshMessages();loadChats();
+}
+
+function setSendState(s){document.getElementById('btn-send').style.display=s?'none':'inline-block';document.getElementById('btn-stop').style.display=s?'inline-block':'none';}
+function stopStream(){if(abortController)abortController.abort();}
+function scrollToBottom(smooth){const el=document.getElementById('messages');smooth?el.scrollTop=el.scrollHeight:el.scrollTo({top:el.scrollHeight,behavior:'instant'});}
+
+function appendMessage(role,content){
+    const el=document.getElementById('messages');if(el.querySelector('.empty-state'))el.querySelector('.empty-state').remove();
+    const domId='msg-tmp-'+Date.now(),div=document.createElement('div');
+    div.className='message '+role;div.id=domId;
+    div.innerHTML=`<div class="msg-header"><span class="msg-role">${role==='user'?'我':'助手'}</span></div><div class="msg-content">${escHtml(content).replace(/\n/g,'<br>')||'...'}</div><button class="msg-copy" onclick="copyMsg(event)" title="复制"><svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg></button>`;
+    el.appendChild(div);scrollToBottom(false);return domId;
+}
+
+function appendReasoning(domId,text){
+    const el=document.getElementById(domId);if(!el)return;let r=el.querySelector('.msg-reasoning');
+    if(!r){r=document.createElement('div');r.className='msg-reasoning';r.innerHTML='<div class="reasoning-bar" onclick="this.parentElement.classList.toggle(\'collapsed\')"><span>分析过程</span><span class="reasoning-arrow">▾</span></div><div class="reasoning-body"></div>';el.querySelector('.msg-content').before(r);}
+    r.querySelector('.reasoning-body').textContent+=text;
+}
+function appendContent(domId,text){const el=document.getElementById(domId);if(!el)return;const c=el.querySelector('.msg-content');if(c.textContent==='...')c.textContent='';c.textContent+=text;}
+function updateMessage(domId,text){const el=document.getElementById(domId);if(el)el.querySelector('.msg-content').textContent=text;}
+
+function copyMsg(e){e.stopPropagation();e.preventDefault();var btn=e.currentTarget,msg=btn.closest('.message'),text=(msg.querySelector('.msg-content')||{}).textContent||'',done=function(){btn.innerHTML='<svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="#16a34a" stroke-width="3"><polyline points="20 6 9 17 4 12"/></svg>';setTimeout(function(){btn.innerHTML='<svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg>';},1500);};if(navigator.clipboard&&navigator.clipboard.writeText){navigator.clipboard.writeText(text).then(done).catch(function(){});}else{var ta=document.createElement('textarea');ta.value=text;ta.style.position='fixed';ta.style.left='-9999px';document.body.appendChild(ta);ta.select();try{document.execCommand('copy');done();}catch(_){}document.body.removeChild(ta);}}
+
+async function refreshMessages(){if(!currentChatId)return;const resp=await fetch('api/chats/'+currentChatId+'/messages'),msgs=await resp.json();currentMessageIds={};const el=document.getElementById('messages');el.innerHTML=msgs.length?msgs.map(m=>renderMessage(m)).join(''):'<div class="empty-state"><p>开始实验吧</p></div>';}
+
+function startRename(id){
+	const span=document.getElementById('ctitle-'+id);
+	if(!span||span.querySelector('input'))return;
+	const old=span.textContent;
+	span.innerHTML=`<input class="chat-item-rename-input" value="${escHtml(old)}" onkeydown="if(event.key==='Enter'){event.preventDefault();saveRename(${id},this)}" onblur="saveRename(${id},this)" onclick="event.stopPropagation()">`;
+	const inp=span.querySelector('input');
+	inp.focus();inp.setSelectionRange(inp.value.length,inp.value.length);
+	span.dataset.old=old;
+}
+function saveRename(id,input){
+	const title=input.value.trim()||'新实验';
+	const span=document.getElementById('ctitle-'+id);
+	if(!span)return;
+	span.textContent=title;
+	if(currentChatId===id)document.getElementById('chat-title').textContent=title;
+	fetch('api/chats/'+id,{method:'PUT',headers:{'Content-Type':'application/json'},body:JSON.stringify({title:title})});
+}
+function renameCurrentChat(){
+	if(!currentChatId)return;
+	const titleEl=document.getElementById('chat-title');
+	if(titleEl.querySelector('input'))return;
+	const old=titleEl.textContent;
+	titleEl.innerHTML=`<input class="chat-item-rename-input header-rename-input" value="${escHtml(old)}" onkeydown="if(event.key==='Enter'){event.preventDefault();saveHeaderRename(this)}" onblur="saveHeaderRename(this)">`;
+	const inp=titleEl.querySelector('input');
+	inp.focus();inp.setSelectionRange(inp.value.length,inp.value.length);
+	titleEl.dataset.old=old;
+}
+function saveHeaderRename(input){
+	const title=input.value.trim()||'新实验';
+	const titleEl=document.getElementById('chat-title');
+	titleEl.textContent=title;
+	const sid=document.getElementById('ctitle-'+currentChatId);
+	if(sid)sid.textContent=title;
+	fetch('api/chats/'+currentChatId,{method:'PUT',headers:{'Content-Type':'application/json'},body:JSON.stringify({title:title})}).then(()=>loadChats());
+}
+function escHtml(s){const d=document.createElement('div');d.textContent=s;return d.innerHTML;}
+function formatDate(ts){const d=new Date(ts*1000),n=new Date();if(d.toDateString()===n.toDateString())return d.toLocaleTimeString('zh-CN',{hour:'2-digit',minute:'2-digit'});return d.toLocaleDateString('zh-CN',{month:'short',day:'numeric'});}
+async function logout(){await fetch('api/auth/logout',{method:'POST'});window.location.href='login';}
+</script>
+</body>
+</html>
