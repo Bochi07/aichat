@@ -19,6 +19,9 @@
 - 🔬 **深度思考模式** — 支持 DeepSeek/千问/小米的推理链展开
 - 🔑 **API Key 管理** — 可视化管理各提供商的访问密钥
 - 🐳 **Docker 部署** — 一条命令即可部署
+## 效果截图
+<img width="2866" height="1610" alt="image" src="https://github.com/user-attachments/assets/4da0f69f-8237-44e3-9eb7-26cf21ecf5f0" />
+
 
 ## 技术栈
 
