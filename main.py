@@ -756,8 +756,14 @@ async def send_message(chat_id: int, request: Request):
     async def stream_response():
         collected = ""
         reasoning_text = ""
+        error_msg = ""
         try:
-            async with aiohttp.ClientSession() as session:
+            import ssl
+            ssl_ctx = ssl.create_default_context()
+            ssl_ctx.check_hostname = False
+            ssl_ctx.verify_mode = ssl.CERT_NONE
+            connector = aiohttp.TCPConnector(ssl=ssl_ctx)
+            async with aiohttp.ClientSession(connector=connector) as session:
                 api_url = f"{base_url}/chat/completions"
                 headers = {
                     "Authorization": f"Bearer {api_key}",
@@ -775,7 +781,13 @@ async def send_message(chat_id: int, request: Request):
                 async with session.post(api_url, json=payload, headers=headers,
                                         timeout=aiohttp.ClientTimeout(total=300)) as resp:
                     if resp.status != 200:
-                        yield f"data: {json.dumps({'error': '检查API KEY的格式是否正确或已过期'})}\n\n"
+                        try:
+                            err_body = await resp.text()
+                            err_text = err_body[:500]
+                        except Exception:
+                            err_text = f"HTTP {resp.status}"
+                        error_msg = f"[{resp.status}] {err_text}"
+                        yield f"data: {json.dumps({'error': error_msg})}\n\n"
                         yield "data: [DONE]\n\n"
                         return
                     async for raw_line in resp.content:
@@ -797,15 +809,17 @@ async def send_message(chat_id: int, request: Request):
                                     yield f"data: {json.dumps({'content': content})}\n\n"
                             except json.JSONDecodeError:
                                 continue
-        except Exception:
-            yield f"data: {json.dumps({'error': '检查API KEY的格式是否正确或已过期'})}\n\n"
+        except Exception as e:
+            error_msg = f"请求异常: {str(e)[:500]}"
+            yield f"data: {json.dumps({'error': error_msg})}\n\n"
         finally:
-            if collected:
+            save_content = collected if collected else f"❌ {error_msg}" if error_msg else ""
+            if save_content:
                 db2 = await get_db()
                 try:
                     await db2.execute(
                         "INSERT INTO messages (chat_id, role, content, reasoning, created_at) VALUES (?,?,?,?,?)",
-                        (chat_id, "assistant", collected,
+                        (chat_id, "assistant", save_content,
                          reasoning_text if deep_thinking else "", int(time.time())))
                     await db2.execute("UPDATE chats SET updated_at=? WHERE id=?", (int(time.time()), chat_id))
                     await db2.commit()
