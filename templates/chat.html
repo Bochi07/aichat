@@ -5,6 +5,100 @@
 <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover">
 <title>个人学习实验台</title>
 <link rel="stylesheet" href="static/style.css">
+<script>
+/* ===== 内建轻量 Markdown 渲染器 ===== */
+(function(){
+const esc=function(s){return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');};
+const parseInline=function(s){
+  s=esc(s);
+  // 图片先（避免与链接冲突）
+  s=s.replace(/!\[([^\]]*)\]\(([^)\s]+)(?:\s+"([^"]*)")?\)/g,'<img src="$2" alt="$1" title="$3">');
+  // 链接
+  s=s.replace(/\[([^\]]+)\]\(([^)\s]+)(?:\s+"([^"]*)")?\)/g,'<a href="$2" title="$3" target="_blank" rel="noopener">$1</a>');
+  // 粗斜体
+  s=s.replace(/\*\*\*(.+?)\*\*\*/g,'<strong><em>$1</em></strong>');
+  s=s.replace(/___(.+?)___/g,'<strong><em>$1</em></strong>');
+  // 粗体
+  s=s.replace(/\*\*(.+?)\*\*/g,'<strong>$1</strong>');
+  s=s.replace(/__(.+?)__/g,'<strong>$1</strong>');
+  // 斜体
+  s=s.replace(/\*(.+?)\*/g,'<em>$1</em>');
+  s=s.replace(/_(.+?)_/g,'<em>$1</em>');
+  // 删除线
+  s=s.replace(/~~(.+?)~~/g,'<del>$1</del>');
+  // 行内代码
+  s=s.replace(/`([^`]+)`/g,'<code>$1</code>');
+  return s;
+};
+const parseCells=function(row){const cells=[],re=/\|/g;let last=0,m;while((m=re.exec(row))!==null){cells.push(row.slice(last,m.index).trim());last=m.index+1;}cells.push(row.slice(last).trim());return cells.filter((_,j,a)=>!(j===0&&a[0]==='')&&!(j===a.length-1&&a[a.length-1]===''));};
+const isSepRow=function(row){const cells=parseCells(row);return cells.length>0&&cells.every(c=>/^:?-{3,}:?$/.test(c.trim()));};
+window.renderMarkdown=function(text){
+  if(!text)return'';
+  try{
+    const lines=text.split('\n'),out=[];
+    let i=0,buf=[],inCode=false,codeLang='',codeContent='',tableRows=[];
+    const flushBuf=function(){
+      if(!buf.length)return;
+      const joined=buf.join('\n');
+      if(joined.split('\n').every(function(l){return l.match(/^>\s?/);})){
+        out.push('<blockquote>'+window.renderMarkdown(buf.map(function(l){return l.replace(/^>\s?/,'');}).join('\n'))+'</blockquote>');
+      }else{
+        out.push('<p>'+buf.map(function(l){return parseInline(l);}).join('<br>')+'</p>');
+      }
+      buf=[];
+    };
+    const flushTable=function(){
+      if(!tableRows.length)return;
+      const rows=tableRows.slice();
+      if(rows.length>=2&&isSepRow(rows[1])){
+        const headCells=parseCells(rows[0]);
+        out.push('<table><thead><tr>'+headCells.map(function(c){return'<th>'+parseInline(c)+'</th>';}).join('')+'</tr></thead><tbody>');
+        for(let k=2;k<rows.length;k++){
+          const cells=parseCells(rows[k]);
+          out.push('<tr>'+cells.map(function(c){return'<td>'+parseInline(c)+'</td>';}).join('')+'</tr>');
+        }
+        out.push('</tbody></table>');
+      }else{
+        out.push('<table><tbody>');
+        for(let k=0;k<rows.length;k++){
+          const cells=parseCells(rows[k]);
+          out.push('<tr>'+cells.map(function(c){return'<td>'+parseInline(c)+'</td>';}).join('')+'</tr>');
+        }
+        out.push('</tbody></table>');
+      }
+      tableRows=[];
+    };
+    while(i<lines.length){
+      const line=lines[i],trimmed=line.trim();
+      if(trimmed.startsWith('```')){
+        flushBuf();flushTable();
+        if(!inCode){inCode=true;codeLang=trimmed.slice(3).trim();codeContent='';}
+        else{inCode=false;out.push('<pre><code'+(codeLang?' class="language-'+esc(codeLang)+'"':'')+'>'+esc(codeContent.replace(/\n$/,''))+'</code></pre>');}
+        i++;continue;
+      }
+      if(inCode){codeContent+=line+'\n';i++;continue;}
+      if(/^(-{3,}|_{3,}|\*{3,})$/.test(trimmed)){flushBuf();flushTable();out.push('<hr>');i++;continue;}
+      const h=trimmed.match(/^(#{1,6})\s+(.+)/);
+      if(h && !trimmed.startsWith('# ')){flushBuf();flushTable();out.push('<h'+h[1].length+'>'+parseInline(h[2])+'</h'+h[1].length+'>');i++;continue;}
+      // 修正：统一处理 # 标题
+      const h2=trimmed.match(/^(#{1,6})\s+(.+)/);
+      if(h2 && h===h2){i++;continue;}
+      const ul=trimmed.match(/^[-*+]\s+(.+)/);
+      if(ul){flushBuf();flushTable();const items=[];while(i<lines.length){const m2=lines[i].trim().match(/^[-*+]\s+(.+)/);if(!m2)break;items.push('<li>'+parseInline(m2[1])+'</li>');i++;}out.push('<ul>'+items.join('')+'</ul>');continue;}
+      const ol=trimmed.match(/^\d+\.\s+(.+)/);
+      if(ol){flushBuf();flushTable();const items=[];while(i<lines.length){const m2=lines[i].trim().match(/^\d+\.\s+(.+)/);if(!m2)break;items.push('<li>'+parseInline(m2[1])+'</li>');i++;}out.push('<ol>'+items.join('')+'</ol>');continue;}
+      if(trimmed.includes('|')&&parseCells(trimmed).length>=1){
+        flushBuf();tableRows.push(trimmed);i++;if(i>=lines.length||(!lines[i].trim().includes('|'))){flushTable();}continue;
+      }
+      if(!trimmed){flushBuf();if(tableRows.length)flushTable();i++;continue;}
+      buf.push(line);i++;
+    }
+    flushBuf();flushTable();
+    return out.join('\n');
+  }catch(e){return esc(text).replace(/\n/g,'<br>');}
+};
+})();
+</script>
 </head>
 <body class="chat-page">
 <div class="app-container">
@@ -48,7 +142,7 @@
         </div>
         <div class="input-area">
             <form class="input-form" onsubmit="sendMessage(event)" id="msg-form">
-                <input type="text" id="msg-input" class="input chat-input" placeholder="输入内容..." autocomplete="off" required enterkeyhint="send">
+                <textarea id="msg-input" class="input chat-input" placeholder="输入内容..." autocomplete="off" rows="1" enterkeyhint="send"></textarea>
                 <button type="submit" class="btn btn-send" id="btn-send">运行</button>
                 <button type="button" class="btn btn-stop" id="btn-stop" style="display:none" onclick="stopStream()">中止</button>
             </form>
@@ -87,6 +181,8 @@ function onProviderChange(save=true){
 }
 function savePrefs(){localStorage.setItem('provider',document.getElementById('provider-select').value);localStorage.setItem('model',document.getElementById('model-select').value);localStorage.setItem('deepThink',document.getElementById('deep-think').checked);}
 loadProviders();loadChats();applySidebarState();
+// 输入框自动扩展 + Enter发送/Shift+Enter换行
+(function(){var t=document.getElementById('msg-input');t.addEventListener('input',function(){this.style.height='auto';this.style.height=Math.min(this.scrollHeight,150)+'px';});t.addEventListener('keydown',function(e){if(e.key==='Enter'&&!e.shiftKey){e.preventDefault();document.getElementById('msg-form').requestSubmit();}});})();
 
 function applySidebarState(){
     document.getElementById('sidebar').classList.toggle('open',sidebarOpen);
@@ -142,8 +238,12 @@ async function selectChat(id,msgId){
 function renderMessage(m){
     const domId='msg-'+m.id;currentMessageIds[domId]=m.id;
     const hasR=m.role==='assistant'&&m.reasoning&&m.reasoning.trim();
-    return`<div class="message ${m.role}" id="${domId}"><div class="msg-header"><span class="msg-role">${m.role==='user'?'我':'助手'}</span><button class="msg-del" onclick="deleteMessage(${m.id},'${domId}')">✕</button></div>${hasR?`<div class="msg-reasoning collapsed"><div class="reasoning-bar" onclick="this.parentElement.classList.toggle('collapsed')"><span>分析过程</span><span class="reasoning-arrow">▾</span></div><div class="reasoning-body">${escHtml(m.reasoning)}</div></div>`:''}<div class="msg-content">${escHtml(m.content).replace(/\n/g,'<br>')}</div><button class="msg-copy" onclick="copyMsg(event)" title="复制"><svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg></button></div>`;
+    const isUser=m.role==='user';
+    // 用户消息：纯文本；AI 消息：渲染 Markdown
+    const rendered=isUser?escHtml(m.content).replace(/\n/g,'<br>'):renderMarkdown(m.content);
+    return`<div class="message ${m.role}" id="${domId}"><div class="msg-header"><span class="msg-role">${isUser?'我':'助手'}</span><button class="msg-del" onclick="deleteMessage(${m.id},'${domId}')">✕</button></div>${hasR?`<div class="msg-reasoning collapsed"><div class="reasoning-bar" onclick="this.parentElement.classList.toggle('collapsed')"><span>分析过程</span><span class="reasoning-arrow">▾</span></div><div class="reasoning-body">${escHtml(m.reasoning)}</div></div>`:''}<div class="msg-content">${rendered}</div><button class="msg-copy" onclick="copyMsg(event)" title="复制"><svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg></button></div>`;
 }
+
 
 async function deleteChat(){if(!currentChatId||!confirm('确定删除此记录？'))return;await fetch('api/chats/'+currentChatId,{method:'DELETE'});currentChatId=null;document.getElementById('chat-title').textContent='个人学习实验台';document.getElementById('btn-delete').style.display='none';document.getElementById('messages').innerHTML='<div class="empty-state"><p>记录已删除</p></div>';loadChats();}
 async function deleteMessage(msgId,domId){if(!confirm('删除这条记录？'))return;const resp=await fetch('api/messages/'+msgId,{method:'DELETE'});if(resp.ok){document.getElementById(domId)&&document.getElementById(domId).remove();delete currentMessageIds[domId];if(!document.querySelectorAll('#messages .message').length)document.getElementById('messages').innerHTML='<div class="empty-state"><p>开始实验吧</p></div>';}}
@@ -175,7 +275,7 @@ async function sendMessage(e){
         document.getElementById('chat-title').textContent=message.slice(0,30);
         document.getElementById('btn-delete').style.display='inline-block';loadChats();
     }
-    input.value='';setSendState(true);
+    input.value='';input.style.height='auto';setSendState(true);
     const userDomId=appendMessage('user',message);
     const aiDomId=appendMessage('assistant','');
     abortController=new AbortController();
@@ -188,6 +288,7 @@ async function sendMessage(e){
                 try{const d=JSON.parse(chunk);if(d.error)updateMessage(aiDomId,'❌ '+d.error);else if(d.reasoning&&deepThink){hasReasoning=true;appendReasoning(aiDomId,d.reasoning);}else if(d.content)appendContent(aiDomId,d.content);const now=Date.now();if(now-lastScroll>80){lastScroll=now;scrollToBottom(true);}}catch(_){}}
         }
         scrollToBottom(false);
+        finalizeMarkdown(aiDomId);
         if(hasReasoning){const r=document.getElementById(aiDomId)&&document.getElementById(aiDomId).querySelector('.msg-reasoning');if(r)r.classList.add('collapsed');}
     }catch(err){if(err.name!=='AbortError')updateMessage(aiDomId,'❌ '+err.message);}
     abortController=null;setSendState(false);await refreshMessages();loadChats();
@@ -201,7 +302,9 @@ function appendMessage(role,content){
     const el=document.getElementById('messages');if(el.querySelector('.empty-state'))el.querySelector('.empty-state').remove();
     const domId='msg-tmp-'+Date.now(),div=document.createElement('div');
     div.className='message '+role;div.id=domId;
-    div.innerHTML=`<div class="msg-header"><span class="msg-role">${role==='user'?'我':'助手'}</span></div><div class="msg-content">${escHtml(content).replace(/\n/g,'<br>')||'...'}</div><button class="msg-copy" onclick="copyMsg(event)" title="复制"><svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg></button>`;
+    const isUser=role==='user';
+    const display=isUser?escHtml(content).replace(/\n/g,'<br>'):'...';
+    div.innerHTML=`<div class="msg-header"><span class="msg-role">${isUser?'我':'助手'}</span></div><div class="msg-content"${isUser?'':' data-raw=""'}>${display}</div><button class="msg-copy" onclick="copyMsg(event)" title="复制"><svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg></button>`;
     el.appendChild(div);scrollToBottom(false);return domId;
 }
 
@@ -210,10 +313,12 @@ function appendReasoning(domId,text){
     if(!r){r=document.createElement('div');r.className='msg-reasoning';r.innerHTML='<div class="reasoning-bar" onclick="this.parentElement.classList.toggle(\'collapsed\')"><span>分析过程</span><span class="reasoning-arrow">▾</span></div><div class="reasoning-body"></div>';el.querySelector('.msg-content').before(r);}
     r.querySelector('.reasoning-body').textContent+=text;
 }
-function appendContent(domId,text){const el=document.getElementById(domId);if(!el)return;const c=el.querySelector('.msg-content');if(c.textContent==='...')c.textContent='';c.textContent+=text;}
-function updateMessage(domId,text){const el=document.getElementById(domId);if(el)el.querySelector('.msg-content').textContent=text;}
+function appendContent(domId,text){const el=document.getElementById(domId);if(!el)return;const c=el.querySelector('.msg-content');if(el.classList.contains('assistant')){if(!c.dataset.raw)c.dataset.raw='';c.dataset.raw+=text;c.textContent=c.dataset.raw;}else{if(c.textContent==='...')c.textContent='';c.textContent+=text;}}
+function updateMessage(domId,text){const el=document.getElementById(domId);if(!el)return;const c=el.querySelector('.msg-content');if(el.classList.contains('assistant')){c.dataset.raw=text;c.textContent=text;}else{c.textContent=text;}}
+function finalizeMarkdown(domId){const el=document.getElementById(domId);if(!el)return;const c=el.querySelector('.msg-content');if(c&&c.dataset.raw){c.innerHTML=renderMarkdown(c.dataset.raw);}}
 
-function copyMsg(e){e.stopPropagation();e.preventDefault();var btn=e.currentTarget,msg=btn.closest('.message'),text=(msg.querySelector('.msg-content')||{}).textContent||'',done=function(){btn.innerHTML='<svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="#16a34a" stroke-width="3"><polyline points="20 6 9 17 4 12"/></svg>';setTimeout(function(){btn.innerHTML='<svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg>';},1500);};if(navigator.clipboard&&navigator.clipboard.writeText){navigator.clipboard.writeText(text).then(done).catch(function(){});}else{var ta=document.createElement('textarea');ta.value=text;ta.style.position='fixed';ta.style.left='-9999px';document.body.appendChild(ta);ta.select();try{document.execCommand('copy');done();}catch(_){}document.body.removeChild(ta);}}
+function getMsgRawText(el){const c=el.querySelector('.msg-content');return c.dataset.raw!==undefined?c.dataset.raw:c.textContent||'';}
+function copyMsg(e){e.stopPropagation();e.preventDefault();var btn=e.currentTarget,msg=btn.closest('.message'),text=getMsgRawText(msg),done=function(){btn.innerHTML='<svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="#16a34a" stroke-width="3"><polyline points="20 6 9 17 4 12"/></svg>';setTimeout(function(){btn.innerHTML='<svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg>';},1500);};if(navigator.clipboard&&navigator.clipboard.writeText){navigator.clipboard.writeText(text).then(done).catch(function(){});}else{var ta=document.createElement('textarea');ta.value=text;ta.style.position='fixed';ta.style.left='-9999px';document.body.appendChild(ta);ta.select();try{document.execCommand('copy');done();}catch(_){}document.body.removeChild(ta);}}
 
 async function refreshMessages(){if(!currentChatId)return;const resp=await fetch('api/chats/'+currentChatId+'/messages'),msgs=await resp.json();currentMessageIds={};const el=document.getElementById('messages');el.innerHTML=msgs.length?msgs.map(m=>renderMessage(m)).join(''):'<div class="empty-state"><p>开始实验吧</p></div>';}
 
