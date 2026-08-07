@@ -1,4 +1,4 @@
-# 个人学习实验台（Personal Learning Lab）
+# AI角色扮演聊天平台
 
 一个轻量级的 AI 聊天前端，支持**多模型提供商**，使用 FastAPI + SQLite 构建，手机端优先设计。
 
