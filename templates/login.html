@@ -25,6 +25,7 @@
         <form id="signup-form" class="auth-form" style="display:none" onsubmit="handleSignup(event)">
             <input type="text" name="username" placeholder="用户名" required autocomplete="username" class="input" maxlength="30">
             <input type="password" name="password" placeholder="密码" required autocomplete="new-password" class="input">
+            <input type="text" name="qq" placeholder="QQ号（用于找回密码）" required class="input" maxlength="11" inputmode="numeric" autocomplete="off">
             <div class="captcha-row">
                 <span class="captcha-question" id="captcha-question">加载中...</span>
                 <input type="text" name="captcha_answer" placeholder="答案" required class="input captcha-input" maxlength="2" autocomplete="off" inputmode="numeric">
@@ -35,9 +36,26 @@
             <button type="submit" class="btn btn-primary">注册</button>
         </form>
 
+        <!-- 忘记密码表单 -->
+        <form id="forgot-form" class="auth-form" style="display:none" onsubmit="handleForgot(event)">
+            <input type="text" name="username" placeholder="用户名" required autocomplete="username" class="input" maxlength="30">
+            <input type="text" name="qq" placeholder="注册时绑定的QQ号" required class="input" maxlength="11" inputmode="numeric" autocomplete="off">
+            <input type="password" name="new_password" placeholder="新密码" required autocomplete="new-password" class="input">
+            <div class="captcha-row">
+                <span class="captcha-question" id="captcha-question-forgot">加载中...</span>
+                <input type="text" name="captcha_answer" placeholder="答案" required class="input captcha-input" maxlength="2" autocomplete="off" inputmode="numeric">
+                <button type="button" class="btn btn-sm captcha-refresh" onclick="refreshCaptchaForgot()">换一题</button>
+            </div>
+            <input type="hidden" name="captcha_signed" id="captcha-signed-forgot">
+            <button type="submit" class="btn btn-primary">重置密码</button>
+        </form>
+
         <p class="auth-toggle">
             <span id="toggle-text">没有账号？</span>
             <a href="#" onclick="toggleMode()" id="toggle-link">立即注册</a>
+        </p>
+        <p class="auth-toggle" style="margin-top:2px">
+            <a href="#" onclick="switchTo('forgot')" id="forgot-link">忘记密码？</a>
         </p>
     </div>
 </div>
@@ -45,14 +63,31 @@
 <script>
 let mode = 'login';
 
-function toggleMode() {
-    mode = mode === 'login' ? 'signup' : 'login';
+function switchTo(newMode) {
+    mode = newMode;
     document.getElementById('login-form').style.display = mode === 'login' ? 'flex' : 'none';
     document.getElementById('signup-form').style.display = mode === 'signup' ? 'flex' : 'none';
-    document.getElementById('toggle-text').textContent = mode === 'login' ? '没有账号？' : '已有账号？';
-    document.getElementById('toggle-link').textContent = mode === 'login' ? '立即注册' : '去登录';
+    document.getElementById('forgot-form').style.display = mode === 'forgot' ? 'flex' : 'none';
+    if (mode === 'login') {
+        document.getElementById('toggle-text').textContent = '没有账号？';
+        document.getElementById('toggle-link').textContent = '立即注册';
+        document.getElementById('forgot-link').style.display = '';
+    } else if (mode === 'signup') {
+        document.getElementById('toggle-text').textContent = '已有账号？';
+        document.getElementById('toggle-link').textContent = '去登录';
+        document.getElementById('forgot-link').style.display = '';
+        refreshCaptcha();
+    } else {
+        document.getElementById('toggle-text').textContent = '想起密码？';
+        document.getElementById('toggle-link').textContent = '去登录';
+        document.getElementById('forgot-link').style.display = 'none';
+        refreshCaptchaForgot();
+    }
     document.getElementById('error-msg').style.display = 'none';
-    if (mode === 'signup') refreshCaptcha();
+}
+
+function toggleMode() {
+    switchTo(mode === 'login' ? 'signup' : 'login');
 }
 
 async function refreshCaptcha() {
@@ -63,6 +98,17 @@ async function refreshCaptcha() {
         document.getElementById('captcha-signed').value = data.signed;
     } catch(e) {
         document.getElementById('captcha-question').textContent = '加载失败';
+    }
+}
+
+async function refreshCaptchaForgot() {
+    try {
+        const resp = await fetch('api/auth/captcha');
+        const data = await resp.json();
+        document.getElementById('captcha-question-forgot').textContent = data.question;
+        document.getElementById('captcha-signed-forgot').value = data.signed;
+    } catch(e) {
+        document.getElementById('captcha-question-forgot').textContent = '加载失败';
     }
 }
 
@@ -93,6 +139,20 @@ async function handleSignup(e) {
         const data = await resp.json();
         if (resp.ok) { window.location.href = './'; }
         else { showError(data.detail || '注册失败'); refreshCaptcha(); }
+    } catch(err) { showError('网络错误'); }
+}
+
+async function handleForgot(e) {
+    e.preventDefault();
+    const fd = new FormData(e.target);
+    if (!fd.get('captcha_answer')) { showError('请输入验证码'); return; }
+    try {
+        const resp = await fetch('api/auth/forgot-password', { method: 'POST', body: fd });
+        const data = await resp.json();
+        if (resp.ok) {
+            alert(data.message);
+            switchTo('login');
+        } else { showError(data.detail || '操作失败'); refreshCaptchaForgot(); }
     } catch(err) { showError('网络错误'); }
 }
 </script>

@@ -39,6 +39,17 @@
             <button type="submit" class="btn btn-primary">修改密码</button>
         </form>
         <div id="pwd-msg"></div>
+        <hr style="border:none;border-top:1px solid #e2e8f0;margin:8px 0">
+        <div class="qq-row">
+            <span class="qq-label">绑定QQ</span>
+            <span id="qq-display">-</span>
+            <button class="btn btn-sm" onclick="editQQ()" id="btn-edit-qq">修改</button>
+        </div>
+        <div id="qq-edit-row" style="display:none">
+            <input type="text" id="qq-input" class="input" placeholder="QQ号（5-11位数字）" maxlength="11" inputmode="numeric" autocomplete="off">
+            <button class="btn btn-sm" onclick="saveQQ()" style="background:var(--primary);color:#fff;white-space:nowrap">保存</button>
+            <button class="btn btn-sm" onclick="cancelEditQQ()" style="white-space:nowrap">取消</button>
+        </div>
     </div>
 
     <div class="settings-section" style="border:1px solid #fecaca">
@@ -77,7 +88,39 @@ async function changePassword(e){e.preventDefault();const pwd=document.getElemen
 
 document.getElementById('del-confirm').addEventListener('input',function(){document.getElementById('btn-del').disabled=this.value.trim()!=='确认注销此账号';});
 async function deleteAccount(e){e.preventDefault();const c=document.getElementById('del-confirm').value.trim();if(c!=='确认注销此账号')return;if(!confirm('不可撤销！'))return;const msg=document.getElementById('del-msg'),resp=await fetch('api/auth/account',{method:'DELETE',headers:{'Content-Type':'application/json'},body:JSON.stringify({confirm:c})}),data=await resp.json();msg.style.display='block';msg.style.fontSize='13px';msg.style.marginTop='6px';if(resp.ok){msg.style.color='#16a34a';msg.textContent='已注销，即将跳转...';setTimeout(()=>{window.location.href='login';},1500);}else{msg.style.color='#dc2626';msg.textContent=data.detail||'失败';}}
-loadInfo();
+loadInfo();loadQQ();
+
+async function loadQQ(){
+    const resp=await fetch('api/auth/qq');
+    const data=await resp.json();
+    const qq=data.qq||'';
+    document.getElementById('qq-display').textContent=qq||'空';
+    document.getElementById('qq-display').style.color=qq?'':'#94a3b8';
+}
+
+function editQQ(){
+    const cur=document.getElementById('qq-display').textContent;
+    document.getElementById('qq-input').value=cur==='空'?'':cur;
+    document.getElementById('qq-edit-row').style.display='flex';
+    document.getElementById('qq-input').focus();
+}
+
+function cancelEditQQ(){
+    document.getElementById('qq-edit-row').style.display='none';
+}
+
+async function saveQQ(){
+    const qq=document.getElementById('qq-input').value.trim();
+    if(!qq){alert('请输入QQ号');return;}
+    const resp=await fetch('api/auth/qq',{method:'PUT',headers:{'Content-Type':'application/json'},body:JSON.stringify({qq})});
+    if(resp.ok){
+        document.getElementById('qq-display').textContent=qq;
+        document.getElementById('qq-display').style.color='';
+        document.getElementById('qq-edit-row').style.display='none';
+    }else{
+        alert((await resp.json()).detail||'保存失败');
+    }
+}
 </script>
 </body>
 </html>
