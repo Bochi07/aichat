@@ -25,7 +25,7 @@
 
 ## 技术栈
 
-- **后端**: Python 3.12+ / FastAPI / aiosqlite
+- **后端**: Python 3.10+ / FastAPI / aiosqlite
 - **前端**: 原生 HTML/CSS/JS（无框架依赖）
 - **数据库**: SQLite（WAL 模式）
 - **认证**: JWT (HS256) + 验证码
@@ -37,7 +37,7 @@
 
 ```bash
 # 1. 克隆项目
-git clone https://github.com/yourname/aichat.git
+git clone https://github.com/Bochi07/aichat.git
 cd aichat
 
 # 2. 创建虚拟环境
