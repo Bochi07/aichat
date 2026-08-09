@@ -163,7 +163,7 @@ docker compose logs aichat   # 首次启动应看到 Uvicorn running on http://0
 docker compose logs -f aichat  # 持续跟踪日志（Ctrl+C 退出）
 ```
 
-浏览器访问 **http://服务器公网IP:3210**（本机部署访问 `http://localhost:3210`）。
+浏览器访问 **http://服务器公网IP:3210**   （本机部署访问 `http://localhost:3210`）。
 
 #### 公网访问放行端口（最容易漏的一步）
 
