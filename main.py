@@ -82,6 +82,8 @@ os.makedirs(DATA_DIR, exist_ok=True)
 DB_PATH = os.path.join(DATA_DIR, "data.db")
 JWT_EXPIRE_SECONDS = 30 * 24 * 3600
 MAX_SESSIONS = 5
+MAX_HISTORY = 30      # 每次发送携带的最大历史消息条数，超出后省略更早的
+MAX_MSG_CHARS = 6000  # 单条历史消息超过该长度时截断
 
 if not SECRET_KEY:
     raise RuntimeError(
@@ -746,6 +748,15 @@ async def send_message(chat_id: int, request: Request):
     finally:
         await db.close()
 
+    omitted = 0
+    if len(history) > MAX_HISTORY:
+        omitted = len(history) - MAX_HISTORY
+        history = history[-MAX_HISTORY:]
+    history = list(history)
+    for m in history:
+        if len(m["content"]) > MAX_MSG_CHARS:
+            m["content"] = m["content"][:MAX_MSG_CHARS] + "\n…（该条内容已截断）"
+
     openai_messages = []
     system_prompt = chat_row.get("system_prompt", "")
     if system_prompt:
@@ -758,6 +769,8 @@ async def send_message(chat_id: int, request: Request):
         reasoning_text = ""
         error_msg = ""
         try:
+            if omitted:
+                yield f"data: {json.dumps({'notice': f'已省略更早的 {omitted} 条消息（如需完整上下文可新开对话）'})}\n\n"
             import ssl
             ssl_ctx = ssl.create_default_context()
             ssl_ctx.check_hostname = False
@@ -770,10 +783,11 @@ async def send_message(chat_id: int, request: Request):
                     "Content-Type": "application/json",
                 }
                 payload = {"model": model, "messages": openai_messages, "stream": True}
-                # 深度分析参数：DeepSeek 用 thinking，小米用 enable_thinking
-                if deep_thinking and provider == "deepseek":
-                    payload["thinking"] = {"type": "enabled"}
-                    payload["reasoning_effort"] = "high"
+                # 深度分析开关：开 = 深度思考，关 = 快速回答（显式关闭思考）
+                if provider == "deepseek":
+                    payload["thinking"] = {"type": "enabled" if deep_thinking else "disabled"}
+                    if deep_thinking:
+                        payload["reasoning_effort"] = "high"
                 if provider == "mimo":
                     payload["enable_thinking"] = deep_thinking
                 if provider == "qwen":
@@ -814,17 +828,21 @@ async def send_message(chat_id: int, request: Request):
             yield f"data: {json.dumps({'error': error_msg})}\n\n"
         finally:
             save_content = collected if collected else f"❌ {error_msg}" if error_msg else ""
+            msg_id = None
             if save_content:
                 db2 = await get_db()
                 try:
-                    await db2.execute(
+                    cur = await db2.execute(
                         "INSERT INTO messages (chat_id, role, content, reasoning, created_at) VALUES (?,?,?,?,?)",
                         (chat_id, "assistant", save_content,
                          reasoning_text if deep_thinking else "", int(time.time())))
+                    msg_id = cur.lastrowid
                     await db2.execute("UPDATE chats SET updated_at=? WHERE id=?", (int(time.time()), chat_id))
                     await db2.commit()
                 finally:
                     await db2.close()
+            if msg_id:
+                yield f"data: {json.dumps({'saved_id': msg_id})}\n\n"
             yield "data: [DONE]\n\n"
 
     return StreamingResponse(stream_response(), media_type="text/event-stream")

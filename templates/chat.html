@@ -277,43 +277,77 @@ async function sendMessage(e){
     }
     input.value='';input.style.height='auto';setSendState(true);
     const userDomId=appendMessage('user',message);
-    const aiDomId=appendMessage('assistant','');
+    const aiDomId=appendMessage('assistant','',deepThink?'正在深度思考…':'正在快速回复…');
     abortController=new AbortController();
+    let savedId=null;
     try{
         const resp=await fetch('api/chats/'+currentChatId+'/send',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({message,provider,model,deep_thinking:deepThink}),signal:abortController.signal});
+        if(!resp.ok){
+            let detail='请求失败 ('+resp.status+')';
+            try{const err=await resp.json();if(err.detail)detail=err.detail;}catch(_){}
+            updateMessage(aiDomId,'❌ '+detail);
+            abortController=null;setSendState(false);loadChats();
+            return;
+        }
         const reader=resp.body.getReader(),decoder=new TextDecoder();
         let buffer='',hasReasoning=false,lastScroll=0;
-        while(true){const{done,value}=await reader.read();if(done)break;buffer+=decoder.decode(value,{stream:true});
-            for(const line of buffer.split('\n')){if(!line.startsWith('data: '))continue;buffer='';const chunk=line.slice(6);if(chunk==='[DONE]')break;
-                try{const d=JSON.parse(chunk);if(d.error)updateMessage(aiDomId,'❌ '+d.error);else if(d.reasoning&&deepThink){hasReasoning=true;appendReasoning(aiDomId,d.reasoning);}else if(d.content)appendContent(aiDomId,d.content);const now=Date.now();if(now-lastScroll>80){lastScroll=now;scrollToBottom(true);}}catch(_){}}
-        }
+        const flushLines=()=>{
+            const lines=buffer.split('\n');
+            buffer=lines.pop()||'';
+            for(const line of lines){
+                if(!line.startsWith('data: '))continue;
+                const chunk=line.slice(6).replace(/\r$/,'');
+                if(chunk==='[DONE]')return true;
+                try{
+                    const d=JSON.parse(chunk);
+                    if(d.error)updateMessage(aiDomId,'❌ '+d.error);
+                    else if(d.notice)showNotice(d.notice,aiDomId);
+                    else if(d.reasoning&&deepThink){hasReasoning=true;appendReasoning(aiDomId,d.reasoning);}
+                    else if(d.content)appendContent(aiDomId,d.content);
+                    else if(d.saved_id)savedId=d.saved_id;
+                    const now=Date.now();if(now-lastScroll>80){lastScroll=now;scrollToBottom(true);}
+                }catch(_){}
+            }
+            return false;
+        };
+        while(true){const{done,value}=await reader.read();if(done)break;buffer+=decoder.decode(value,{stream:true});if(flushLines())break;}
+        flushLines();
         scrollToBottom(false);
         finalizeMarkdown(aiDomId);
         if(hasReasoning){const r=document.getElementById(aiDomId)&&document.getElementById(aiDomId).querySelector('.msg-reasoning');if(r)r.classList.add('collapsed');}
-    }catch(err){if(err.name!=='AbortError')updateMessage(aiDomId,'❌ '+err.message);}
-    abortController=null;setSendState(false);await refreshMessages();loadChats();
+        if(savedId){const el=document.getElementById(aiDomId);if(el){el.id='msg-'+savedId;currentMessageIds[el.id]=savedId;const h=el.querySelector('.msg-header');if(h&&!h.querySelector('.msg-del')){const b=document.createElement('button');b.className='msg-del';b.textContent='✕';b.setAttribute('onclick','deleteMessage('+savedId+',\''+el.id+'\')');h.appendChild(b);}}}
+        if(!savedId)await refreshMessages();
+    }catch(err){if(err.name!=='AbortError')updateMessage(aiDomId,'❌ '+err.message);await refreshMessages();}
+    abortController=null;setSendState(false);loadChats();
 }
 
 function setSendState(s){document.getElementById('btn-send').style.display=s?'none':'inline-block';document.getElementById('btn-stop').style.display=s?'inline-block':'none';}
 function stopStream(){if(abortController)abortController.abort();}
 function scrollToBottom(smooth){const el=document.getElementById('messages');smooth?el.scrollTop=el.scrollHeight:el.scrollTo({top:el.scrollHeight,behavior:'instant'});}
+function showNotice(text,aiDomId){
+    const el=document.getElementById('messages'),ai=el&&document.getElementById(aiDomId||'');if(!el)return;
+    const d=document.createElement('div');d.className='msg-notice';d.textContent=text;
+    if(ai)el.insertBefore(d,ai);else el.appendChild(d);
+    scrollToBottom(false);
+}
 
-function appendMessage(role,content){
+function appendMessage(role,content,placeholder){
     const el=document.getElementById('messages');if(el.querySelector('.empty-state'))el.querySelector('.empty-state').remove();
     const domId='msg-tmp-'+Date.now(),div=document.createElement('div');
     div.className='message '+role;div.id=domId;
     const isUser=role==='user';
-    const display=isUser?escHtml(content).replace(/\n/g,'<br>'):'...';
+    const display=isUser?escHtml(content).replace(/\n/g,'<br>'):(placeholder||'正在思考…');
     div.innerHTML=`<div class="msg-header"><span class="msg-role">${isUser?'我':'助手'}</span></div><div class="msg-content"${isUser?'':' data-raw=""'}>${display}</div><button class="msg-copy" onclick="copyMsg(event)" title="复制"><svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg></button>`;
     el.appendChild(div);scrollToBottom(false);return domId;
 }
 
 function appendReasoning(domId,text){
     const el=document.getElementById(domId);if(!el)return;let r=el.querySelector('.msg-reasoning');
+    const c=el.querySelector('.msg-content');if(c&&['...','正在思考…','正在深度思考…','正在快速回复…'].includes(c.textContent))c.textContent='';
     if(!r){r=document.createElement('div');r.className='msg-reasoning';r.innerHTML='<div class="reasoning-bar" onclick="this.parentElement.classList.toggle(\'collapsed\')"><span>分析过程</span><span class="reasoning-arrow">▾</span></div><div class="reasoning-body"></div>';el.querySelector('.msg-content').before(r);}
     r.querySelector('.reasoning-body').textContent+=text;
 }
-function appendContent(domId,text){const el=document.getElementById(domId);if(!el)return;const c=el.querySelector('.msg-content');if(el.classList.contains('assistant')){if(!c.dataset.raw)c.dataset.raw='';c.dataset.raw+=text;c.textContent=c.dataset.raw;}else{if(c.textContent==='...')c.textContent='';c.textContent+=text;}}
+function appendContent(domId,text){const el=document.getElementById(domId);if(!el)return;const c=el.querySelector('.msg-content');if(el.classList.contains('assistant')){if(!c.dataset.raw)c.dataset.raw='';c.dataset.raw+=text;c.textContent=c.dataset.raw;}else{if(['...','正在思考…','正在深度思考…','正在快速回复…'].includes(c.textContent))c.textContent='';c.textContent+=text;}}
 function updateMessage(domId,text){const el=document.getElementById(domId);if(!el)return;const c=el.querySelector('.msg-content');if(el.classList.contains('assistant')){c.dataset.raw=text;c.textContent=text;}else{c.textContent=text;}}
 function finalizeMarkdown(domId){const el=document.getElementById(domId);if(!el)return;const c=el.querySelector('.msg-content');if(c&&c.dataset.raw){c.innerHTML=renderMarkdown(c.dataset.raw);}}
 
