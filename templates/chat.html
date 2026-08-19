@@ -253,7 +253,9 @@ function renderMessage(m){
     const isUser=m.role==='user';
     // 用户消息：纯文本；AI 消息：渲染 Markdown
     const rendered=isUser?escHtml(m.content).replace(/\n/g,'<br>'):renderMarkdown(m.content);
-    return`<div class="message ${m.role}" id="${domId}"><div class="msg-header"><span class="msg-role">${isUser?'我':'助手'}</span><button class="msg-del" onclick="deleteMessage(${m.id},'${domId}')">✕</button></div>${hasR?`<div class="msg-reasoning collapsed"><div class="reasoning-bar" onclick="this.parentElement.classList.toggle('collapsed')"><span>分析过程</span><span class="reasoning-arrow">▾</span></div><div class="reasoning-body">${escHtml(m.reasoning)}</div></div>`:''}<div class="msg-content">${rendered}</div><button class="msg-copy" onclick="copyMsg(event)" title="复制"><svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg></button></div>`;
+    const tIn=m.tokens_in||0,tOut=m.tokens_out||0;
+    const tokenHtml=(!isUser&&(tIn||tOut))?`<div class="msg-tokens">⬆ ${fmtTok(tIn)} · ⬇ ${fmtTok(tOut)} · 共 ${fmtTok(tIn+tOut)}</div>`:'';
+    return`<div class="message ${m.role}" id="${domId}"><div class="msg-header"><span class="msg-role">${isUser?'我':'助手'}</span><button class="msg-del" onclick="deleteMessage(${m.id},'${domId}')">✕</button></div>${hasR?`<div class="msg-reasoning collapsed"><div class="reasoning-bar" onclick="this.parentElement.classList.toggle('collapsed')"><span>分析过程</span><span class="reasoning-arrow">▾</span></div><div class="reasoning-body">${escHtml(m.reasoning)}</div></div>`:''}<div class="msg-content">${rendered}</div>${tokenHtml}<button class="msg-copy" onclick="copyMsg(event)" title="复制"><svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg></button></div>`;
 }
 
 
@@ -316,7 +318,9 @@ async function sendMessage(e){
                     else if(d.notice)showNotice(d.notice,aiDomId);
                     else if(d.reasoning&&deepThink){hasReasoning=true;appendReasoning(aiDomId,d.reasoning);}
                     else if(d.content)appendContent(aiDomId,d.content);
-                    else if(d.saved_id)savedId=d.saved_id;
+                    if(d.saved_id!==undefined){savedId=d.saved_id;}
+                    if(d.tokens_in!==undefined){showTokens(aiDomId,d.tokens_in,d.tokens_out);}
+                    if(d.window_pct>=85){showNotice('⚠️ 对话上下文已使用约 '+d.window_pct+'%，继续对话将开始省略更早内容',aiDomId);}
                     const now=Date.now();if(now-lastScroll>80){lastScroll=now;scrollToBottom(true);}
                 }catch(_){}
             }
@@ -402,6 +406,14 @@ function saveHeaderRename(input){
 	const sid=document.getElementById('ctitle-'+currentChatId);
 	if(sid)sid.textContent=title;
 	fetch('api/chats/'+currentChatId,{method:'PUT',headers:{'Content-Type':'application/json'},body:JSON.stringify({title:title})}).then(()=>loadChats());
+}
+function fmtTok(n){n=Number(n)||0;return n.toLocaleString('en-US');}
+function showTokens(domId,tokensIn,tokensOut){
+    const el=document.getElementById(domId);if(!el)return;
+    const tIn=Number(tokensIn)||0,tOut=Number(tokensOut)||0;
+    let t=el.querySelector('.msg-tokens');
+    if(!t){t=document.createElement('div');t.className='msg-tokens';el.appendChild(t);}
+    t.textContent='⬆ '+fmtTok(tIn)+' · ⬇ '+fmtTok(tOut)+' · 共 '+fmtTok(tIn+tOut);
 }
 function escHtml(s){const d=document.createElement('div');d.textContent=s;return d.innerHTML;}
 function formatDate(ts){const d=new Date(ts*1000),n=new Date();if(d.toDateString()===n.toDateString())return d.toLocaleTimeString('zh-CN',{hour:'2-digit',minute:'2-digit'});return d.toLocaleDateString('zh-CN',{month:'short',day:'numeric'});}
