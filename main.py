@@ -2,6 +2,7 @@
 个人学习实验台 - 多模型支持
 FastAPI + SQLite，明文密码，手机端优化
 """
+import asyncio
 import hashlib
 import hmac
 import json
@@ -82,7 +83,7 @@ PORT = int(os.getenv("PORT", "3210"))
 DATA_DIR = os.environ.get("DATA_DIR", os.path.dirname(os.path.abspath(__file__)))
 os.makedirs(DATA_DIR, exist_ok=True)
 DB_PATH = os.path.join(DATA_DIR, "data.db")
-JWT_EXPIRE_SECONDS = 30 * 24 * 3600
+JWT_EXPIRE_SECONDS = 7 * 24 * 3600
 MAX_SESSIONS = 5
 MAX_HISTORY = 30      # 每次发送携带的最大历史消息条数，超出后省略更早的
 MAX_MSG_CHARS = 6000  # 单条历史消息超过该长度时截断
@@ -277,27 +278,34 @@ async def get_current_user(request: Request) -> dict:
             raise HTTPException(401, "用户不存在")
         if data.get("pwd_ver", 0) != row["pwd_changed_at"]:
             raise HTTPException(401, "登录已过期，请重新登录")
+        sess = await fetch_one(db, "SELECT 1 FROM sessions WHERE user_id=? AND jti=?",
+                               (row["id"], data.get("jti", "")))
+        if not sess:
+            raise HTTPException(401, "登录已过期，请重新登录")
         return row
     finally:
         await db.close()
 
+_SESSION_LOCK = asyncio.Lock()   # 会话表读改写串行化，避免并发登录突破 MAX_SESSIONS
+
 async def _enforce_session_limit(user_id: int, current_jti: str):
-    db = await get_db()
-    try:
-        sessions = await fetch_all(db,
-            "SELECT jti, created_at FROM sessions WHERE user_id=? ORDER BY created_at ASC", (user_id,))
-        if len(sessions) >= MAX_SESSIONS:
-            to_remove = sessions[:len(sessions) - MAX_SESSIONS + 1]
-            for s in to_remove:
-                old = await fetch_one(db, "SELECT jti FROM sessions WHERE jti=?", (s["jti"],))
-                if old:
-                    TOKEN_BLACKLIST[old["jti"]] = int(time.time()) + JWT_EXPIRE_SECONDS
-                    await db.execute("DELETE FROM sessions WHERE jti=?", (old["jti"],))
-        await db.execute("INSERT INTO sessions (user_id, jti, created_at) VALUES (?,?,?)",
-                         (user_id, current_jti, int(time.time())))
-        await db.commit()
-    finally:
-        await db.close()
+    async with _SESSION_LOCK:
+        db = await get_db()
+        try:
+            sessions = await fetch_all(db,
+                "SELECT jti, created_at FROM sessions WHERE user_id=? ORDER BY created_at ASC", (user_id,))
+            if len(sessions) >= MAX_SESSIONS:
+                to_remove = sessions[:len(sessions) - MAX_SESSIONS + 1]
+                for s in to_remove:
+                    old = await fetch_one(db, "SELECT jti FROM sessions WHERE jti=?", (s["jti"],))
+                    if old:
+                        TOKEN_BLACKLIST[old["jti"]] = int(time.time()) + JWT_EXPIRE_SECONDS
+                        await db.execute("DELETE FROM sessions WHERE jti=?", (old["jti"],))
+            await db.execute("INSERT INTO sessions (user_id, jti, created_at) VALUES (?,?,?)",
+                             (user_id, current_jti, int(time.time())))
+            await db.commit()
+        finally:
+            await db.close()
 
 async def _remove_session(jti: str):
     db = await get_db()
@@ -306,6 +314,31 @@ async def _remove_session(jti: str):
         await db.commit()
     finally:
         await db.close()
+
+def _current_jti(request: Request) -> str:
+    token = request.cookies.get("token")
+    if token:
+        data = decode_token(token)
+        if data:
+            return data.get("jti", "")
+    return ""
+
+async def _activate_single_session(user_id: int, current_jti: str):
+    """问答操作后仅保留当前设备会话，踢出同账号的其他设备
+    （删除其 sessions 行并拉黑 token，重启后仍生效）"""
+    async with _SESSION_LOCK:
+        db = await get_db()
+        try:
+            others = await fetch_all(db,
+                "SELECT jti FROM sessions WHERE user_id=? AND jti<>?", (user_id, current_jti))
+            if others:
+                now = int(time.time())
+                for s in others:
+                    TOKEN_BLACKLIST[s["jti"]] = now + JWT_EXPIRE_SECONDS
+                await db.execute("DELETE FROM sessions WHERE user_id=? AND jti<>?", (user_id, current_jti))
+                await db.commit()
+        finally:
+            await db.close()
 
 # ============================================================
 # 验证码
@@ -325,10 +358,16 @@ def _verify_captcha(signed: str) -> bool:
     except Exception:
         return False
 
-_USED_CAPTCHAS = set()
+_USED_CAPTCHAS: dict = {}   # signed -> 消耗时间戳（带过期清理，防内存无限增长）
+_CAPTCHA_TTL = 300          # 验证码有效期（秒）
 
 def _verify_captcha_flow(captcha_signed: str, captcha_answer: str):
-    """校验并消耗验证码（供注册/找回密码共用）"""
+    """校验并消耗验证码（供注册/找回密码共用），带过期清理"""
+    now = time.time()
+    # 清理已过期的验证码记录，避免无限增长
+    if len(_USED_CAPTCHAS) > 100:
+        for k in [k for k, v in _USED_CAPTCHAS.items() if v <= now - _CAPTCHA_TTL]:
+            del _USED_CAPTCHAS[k]
     if not captcha_signed or not captcha_answer:
         raise HTTPException(400, "请输入验证码")
     if not _verify_captcha(captcha_signed):
@@ -337,7 +376,7 @@ def _verify_captcha_flow(captcha_signed: str, captcha_answer: str):
         raise HTTPException(400, "验证码答案错误")
     if captcha_signed in _USED_CAPTCHAS:
         raise HTTPException(400, "验证码已使用")
-    _USED_CAPTCHAS.add(captcha_signed)
+    _USED_CAPTCHAS[captcha_signed] = now
 
 # ============================================================
 # 安全中间件
@@ -383,14 +422,21 @@ async def inject_user(request: Request, call_next):
     token = request.cookies.get("token")
     if token:
         data = decode_token(token)
-        if data and not _is_token_revoked(data.get("jti", "")):
-            db = await get_db()
-            try:
-                row = await fetch_one(db, "SELECT * FROM users WHERE id=?", (data["user_id"],))
-                if row and data.get("pwd_ver", 0) == row["pwd_changed_at"]:
-                    request.state.user = row
-            finally:
-                await db.close()
+        if data:
+            _cleanup_blacklist()
+            if not _is_token_revoked(data.get("jti", "")):
+                db = await get_db()
+                try:
+                    # 会话必须仍存在于 sessions 表（踢出/登出/改密后即为无效）
+                    row = await fetch_one(db, """
+                        SELECT u.* FROM users u
+                        JOIN sessions s ON s.user_id = u.id AND s.jti = ?
+                        WHERE u.id = ?
+                    """, (data.get("jti", ""), data["user_id"]))
+                    if row and data.get("pwd_ver", 0) == row["pwd_changed_at"]:
+                        request.state.user = row
+                finally:
+                    await db.close()
     return await call_next(request)
 
 # ============================================================
@@ -561,9 +607,12 @@ async def change_password(request: Request):
     _check_password(new_password)
     db = await get_db()
     try:
-        await db.execute("UPDATE users SET password=? WHERE id=?", (new_password, user["id"]))
+        now = int(time.time())
+        await db.execute("UPDATE users SET password=?, pwd_changed_at=? WHERE id=?",
+                         (new_password, now, user["id"]))
+        await db.execute("DELETE FROM sessions WHERE user_id=?", (user["id"],))
         await db.commit()
-        return JSONResponse({"ok": True, "message": "密码已修改"})
+        return JSONResponse({"ok": True, "message": "密码已修改，请重新登录"})
     finally:
         await db.close()
 
@@ -828,6 +877,8 @@ async def delete_message(msg_id: int, request: Request):
 async def send_message(chat_id: int, request: Request):
     user = await get_current_user(request)
     _rate_limit(f"send:u{user['id']}", 30, 60)
+    # 问答操作：踢出同账号的其他设备，仅保留当前设备会话
+    await _activate_single_session(user["id"], _current_jti(request))
 
     data = await request.json()
     message = (data.get("message") or "").strip()
