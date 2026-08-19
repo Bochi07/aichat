@@ -320,7 +320,7 @@ async function sendMessage(e){
                     else if(d.content)appendContent(aiDomId,d.content);
                     if(d.saved_id!==undefined){savedId=d.saved_id;}
                     if(d.tokens_in!==undefined){showTokens(aiDomId,d.tokens_in,d.tokens_out);}
-                    if(d.window_pct>=85){showNotice('⚠️ 对话上下文已使用约 '+d.window_pct+'%，继续对话将开始省略更早内容',aiDomId);}
+                    if(d.window_pct>=90){showNotice('⚠️ 对话上下文已使用约 '+d.window_pct+'%，继续对话将开始省略更早内容',aiDomId);}
                     const now=Date.now();if(now-lastScroll>80){lastScroll=now;scrollToBottom(true);}
                 }catch(_){}
             }
