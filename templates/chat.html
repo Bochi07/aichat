@@ -11,10 +11,22 @@
 const esc=function(s){return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');};
 const parseInline=function(s){
   s=esc(s);
+  // 仅允许 http/https/mailto 协议，拦截 javascript:/data:/vbscript: 等
+  const safeUrl=function(raw){
+    var u=(raw||'').trim();
+    if(!u)return'';
+    var m=u.match(/^([a-zA-Z][a-zA-Z0-9+.-]*):/);
+    if(m&&['http','https','mailto'].indexOf(m[1].toLowerCase())<0)return'#';
+    return u;
+  };
   // 图片先（避免与链接冲突）
-  s=s.replace(/!\[([^\]]*)\]\(([^)\s]+)(?:\s+"([^"]*)")?\)/g,'<img src="$2" alt="$1" title="$3">');
+  s=s.replace(/!\[([^\]]*)\]\(([^)\s]+)(?:\s+"([^"]*)")?\)/g,function(_,alt,url,title){
+    return'<img src="'+safeUrl(url)+'" alt="'+alt+'" title="'+(title||'')+'">';
+  });
   // 链接
-  s=s.replace(/\[([^\]]+)\]\(([^)\s]+)(?:\s+"([^"]*)")?\)/g,'<a href="$2" title="$3" target="_blank" rel="noopener">$1</a>');
+  s=s.replace(/\[([^\]]+)\]\(([^)\s]+)(?:\s+"([^"]*)")?\)/g,function(_,text,url,title){
+    return'<a href="'+safeUrl(url)+'" title="'+(title||'')+'" target="_blank" rel="noopener">'+text+'</a>';
+  });
   // 粗斜体
   s=s.replace(/\*\*\*(.+?)\*\*\*/g,'<strong><em>$1</em></strong>');
   s=s.replace(/___(.+?)___/g,'<strong><em>$1</em></strong>');
