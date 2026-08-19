@@ -275,6 +275,14 @@ textarea.input { resize: vertical; min-height: 60px; }
     padding: 10px 14px; border-radius: 16px; font-size: 15px;
     line-height: 1.6; word-break: break-word; white-space: pre-wrap;
 }
+.msg-tokens {
+    font-size: 11px;
+    opacity: .55;
+    color: var(--text-secondary);
+    padding: 3px 8px 0;
+    line-height: 1.4;
+    user-select: none;
+}
 /* 思考过程 */
 .msg-reasoning { margin-bottom: 4px; }
 .msg-reasoning .reasoning-bar {
