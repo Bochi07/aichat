@@ -68,6 +68,45 @@ PROVIDERS = {
 }
 
 # ============================================================
+# 各模型上下文窗口（token 数，用于动态裁剪历史）
+# 按各提供商官方/常见窗口配置；如与实际不符，请按需调整。
+# 未列出的模型回退到 CONTEXT_FALLBACK_TOKENS。
+# ============================================================
+MODEL_CONTEXT_TOKENS = {
+    "deepseek-v4-pro": 65536,
+    "deepseek-v4-flash": 65536,
+    "qwen3.7-max": 32768, "qwen-max": 32768,
+    "qwen3.7-plus": 131072, "qwen-plus": 131072,
+    "qwen3.6-flash": 131072, "qwen-flash": 131072,
+    "qwen-long-latest": 262144,
+    "ernie-5.1": 131072,
+    "ernie-4.5-turbo-128k-preview": 131072,
+    "ernie-4.0-turbo-128k": 131072,
+    "ernie-4.0-turbo-8k": 8192,
+    "ernie-3.5-8k": 8192,
+    "ernie-speed-8k": 8192,
+    "ernie-speed-128k": 131072,
+    "ernie-lite-8k": 8192,
+    "mimo-v2-flash": 32768,
+    "mimo-v2-pro": 32768,
+    "mimo-v2.5-pro": 32768,
+}
+
+def _get_context_window(model: str) -> int:
+    """返回指定模型的上下文窗口 token 数"""
+    return MODEL_CONTEXT_TOKENS.get(model, CONTEXT_FALLBACK_TOKENS)
+
+def _estimate_tokens(text: str) -> int:
+    """粗略估算文本 token 数（中英混合）。
+    中文按 ~0.75 token/字、其他字符按 ~0.28 token/字符，
+    再上浮 10% 作为安全余量，避免超出模型上下文窗口。"""
+    if not text:
+        return 0
+    cn = sum(1 for ch in text if ord(ch) > 0x2E80)
+    other = len(text) - cn
+    return max(1, int((cn * 0.75 + other * 0.28) * 1.1))
+
+# ============================================================
 # 配置
 # ============================================================
 try:
@@ -85,8 +124,8 @@ os.makedirs(DATA_DIR, exist_ok=True)
 DB_PATH = os.path.join(DATA_DIR, "data.db")
 JWT_EXPIRE_SECONDS = 7 * 24 * 3600
 MAX_SESSIONS = 5
-MAX_HISTORY = 30      # 每次发送携带的最大历史消息条数，超出后省略更早的
-MAX_MSG_CHARS = 6000  # 单条历史消息超过该长度时截断
+OUTPUT_RESERVE_TOKENS = 4096      # 给模型回复预留的输出 token 数
+CONTEXT_FALLBACK_TOKENS = 32768   # 未在 MODEL_CONTEXT_TOKENS 中列出的模型默认窗口
 
 if not SECRET_KEY:
     raise RuntimeError(
@@ -205,6 +244,8 @@ async def init_db():
             role TEXT NOT NULL,
             content TEXT NOT NULL,
             reasoning TEXT NOT NULL DEFAULT '',
+            tokens_in INTEGER NOT NULL DEFAULT 0,
+            tokens_out INTEGER NOT NULL DEFAULT 0,
             created_at INTEGER NOT NULL,
             FOREIGN KEY (chat_id) REFERENCES chats(id) ON DELETE CASCADE
         );
@@ -221,6 +262,16 @@ async def init_db():
         pass
     try:
         await db.execute("ALTER TABLE messages ADD COLUMN reasoning TEXT NOT NULL DEFAULT ''")
+        await db.commit()
+    except Exception:
+        pass
+    try:
+        await db.execute("ALTER TABLE messages ADD COLUMN tokens_in INTEGER NOT NULL DEFAULT 0")
+        await db.commit()
+    except Exception:
+        pass
+    try:
+        await db.execute("ALTER TABLE messages ADD COLUMN tokens_out INTEGER NOT NULL DEFAULT 0")
         await db.commit()
     except Exception:
         pass
@@ -913,8 +964,8 @@ async def send_message(chat_id: int, request: Request):
     db = await get_db()
     try:
         await db.execute(
-            "INSERT INTO messages (chat_id, role, content, reasoning, created_at) VALUES (?,?,?,?,?)",
-            (chat_id, "user", message, "", now))
+            "INSERT INTO messages (chat_id, role, content, reasoning, tokens_in, tokens_out, created_at) VALUES (?,?,?,?,?,?,?)",
+            (chat_id, "user", message, "", 0, 0, now))
         await db.execute("UPDATE chats SET updated_at=? WHERE id=?", (now, chat_id))
         await db.commit()
         history = await fetch_all(db,
@@ -922,29 +973,40 @@ async def send_message(chat_id: int, request: Request):
     finally:
         await db.close()
 
-    omitted = 0
-    if len(history) > MAX_HISTORY:
-        omitted = len(history) - MAX_HISTORY
-        history = history[-MAX_HISTORY:]
-    history = list(history)
-    for m in history:
-        if len(m["content"]) > MAX_MSG_CHARS:
-            m["content"] = m["content"][:MAX_MSG_CHARS] + "\n…（该条内容已截断）"
+    # 动态上下文：按模型窗口尽可能保留全部历史，
+    # 只有总 token 超出窗口（扣除 system_prompt 与回复预留）时才从最旧开始丢弃
+    system_prompt = chat_row.get("system_prompt", "")
+    context_window = _get_context_window(model)
+    budget = context_window - OUTPUT_RESERVE_TOKENS - _estimate_tokens(system_prompt)
+    kept = []
+    used = 0
+    for m in reversed(history):
+        cost = _estimate_tokens(m.get("content") or "")
+        if kept and used + cost > budget:
+            break
+        kept.append(m)
+        used += cost
+    kept.reverse()
+    omitted = len(history) - len(kept)
+
+    # 本次实际发送的上下文 token（估算）与窗口占用百分比
+    prompt_est = used + _estimate_tokens(system_prompt)
+    window_pct = min(100.0, (prompt_est + OUTPUT_RESERVE_TOKENS) / context_window * 100)
 
     openai_messages = []
-    system_prompt = chat_row.get("system_prompt", "")
     if system_prompt:
         openai_messages.append({"role": "system", "content": system_prompt})
-    for m in history:
+    for m in kept:
         openai_messages.append({"role": m["role"], "content": m["content"]})
 
     async def stream_response():
         collected = ""
         reasoning_text = ""
         error_msg = ""
+        usage_capture = {}   # 上游若返回 usage 则记录真实 token 数
         try:
             if omitted:
-                yield f"data: {json.dumps({'notice': f'已省略更早的 {omitted} 条消息（如需完整上下文可新开对话）'})}\n\n"
+                yield f"data: {json.dumps({'notice': f'对话较长，为适配模型上下文窗口已省略更早的 {omitted} 条消息'})}\n\n"
             async with aiohttp.ClientSession() as session:
                 api_url = f"{base_url}/chat/completions"
                 headers = {
@@ -957,6 +1019,8 @@ async def send_message(chat_id: int, request: Request):
                     payload["thinking"] = {"type": "enabled" if deep_thinking else "disabled"}
                     if deep_thinking:
                         payload["reasoning_effort"] = "high"
+                    # 让流式响应的最后一个 chunk 携带 usage（真实 token 计数）
+                    payload["stream_options"] = {"include_usage": True}
                 if provider == "mimo":
                     payload["enable_thinking"] = deep_thinking
                 if provider == "qwen":
@@ -981,6 +1045,9 @@ async def send_message(chat_id: int, request: Request):
                                 break
                             try:
                                 chunk_data = json.loads(chunk)
+                                if chunk_data.get("usage"):
+                                    usage_capture["in"] = (chunk_data["usage"] or {}).get("prompt_tokens")
+                                    usage_capture["out"] = (chunk_data["usage"] or {}).get("completion_tokens")
                                 delta = chunk_data.get("choices", [{}])[0].get("delta", {})
                                 content = delta.get("content", "")
                                 reasoning = delta.get("reasoning_content", "")
@@ -997,21 +1064,24 @@ async def send_message(chat_id: int, request: Request):
             yield f"data: {json.dumps({'error': error_msg})}\n\n"
         finally:
             save_content = collected if collected else f"❌ {error_msg}" if error_msg else ""
+            # 优先用上游返回的真实 usage；未返回则用本地估算兜底
+            tokens_in = usage_capture.get("in") or prompt_est
+            tokens_out = usage_capture.get("out") or _estimate_tokens(collected)
             msg_id = None
             if save_content:
                 db2 = await get_db()
                 try:
                     cur = await db2.execute(
-                        "INSERT INTO messages (chat_id, role, content, reasoning, created_at) VALUES (?,?,?,?,?)",
+                        "INSERT INTO messages (chat_id, role, content, reasoning, tokens_in, tokens_out, created_at) VALUES (?,?,?,?,?,?,?)",
                         (chat_id, "assistant", save_content,
-                         reasoning_text if deep_thinking else "", int(time.time())))
+                         reasoning_text if deep_thinking else "", tokens_in, tokens_out, int(time.time())))
                     msg_id = cur.lastrowid
                     await db2.execute("UPDATE chats SET updated_at=? WHERE id=?", (int(time.time()), chat_id))
                     await db2.commit()
                 finally:
                     await db2.close()
             if msg_id:
-                yield f"data: {json.dumps({'saved_id': msg_id})}\n\n"
+                yield f"data: {json.dumps({'saved_id': msg_id, 'tokens_in': tokens_in, 'tokens_out': tokens_out, 'window_pct': round(window_pct)})}\n\n"
             yield "data: [DONE]\n\n"
 
     return StreamingResponse(stream_response(), media_type="text/event-stream")
