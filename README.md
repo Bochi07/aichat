@@ -15,8 +15,7 @@
 - [环境变量](#环境变量)
 
 **部署部分**
-- [快速开始](#快速开始)
-- [生产环境部署](#生产环境部署)
+- [Docker 部署](#docker-部署)
 - [常见启动错误](#常见启动错误)
 - [运行时错误](#运行时错误)
 - [自定义修改指南](#自定义修改指南)
@@ -44,7 +43,11 @@
 - 💬 **多轮对话** — 保存历史对话，支持搜索，AI的回复使用内建轻量Markdown渲染器渲染
 - 🔬 **深度思考模式** — 支持 DeepSeek/千问/小米的推理链展开
 - 🔑 **API Key 管理** — 可视化管理各提供商的访问密钥
+- 🔐 **绑定QQ / 忘记密码** — 注册时绑定 QQ，可通过 QQ 验证重置密码
+- 🛡️ **访问限流 / CSRF 防护** — 登录、注册、发送均限流，写请求做同源校验
 - 🐳 **Docker 部署** — 一条命令启动（详见部署部分）
+
+> 📌 **忘记密码**依赖注册时绑定的 QQ 号。老用户升级后需先在「设置 → 绑定QQ」填写一次，才可使用忘记密码功能。
 
 ## 效果截图
 
@@ -89,29 +92,7 @@ aichat/
 
 # 部署部分
 
-## 快速开始
-
-### 本地运行（开发调试用）
-
-```bash
-# 1. 克隆项目
-git clone https://github.com/Bochi07/aichat.git
-cd aichat
-
-# 2. 创建虚拟环境并安装依赖
-python -m venv .venv
-source .venv/bin/activate          # Linux/Mac；Windows 用 .venv\Scripts\activate
-pip install -r requirements.txt
-
-# 3. 生成 SECRET_KEY 并写入 .env（重要！）
-echo "SECRET_KEY=$(python3 -c 'import secrets;print(secrets.token_hex(32))')" > .env
-
-# 4. 启动
-python main.py
-# 访问 http://localhost:3210
-```
-
-### Docker 部署（推荐，服务器/生产用）
+## Docker 部署
 
 > 新版 Docker 使用 `docker compose`（无连字符）子命令；只有老版本才用 `docker-compose`。下文统一用新版写法。
 
@@ -201,104 +182,6 @@ docker compose down
 # 更新代码后重新构建并启动
 git pull origin main
 docker compose up -d --build
-```
-
-## 生产环境部署
-
-### 使用 Gunicorn（Docker 之外的选择）
-
-先按「快速开始」的步骤装好依赖（需创建虚拟环境），然后：
-
-1. **修改 `gunicorn_conf.py`**：把里面的路径改成你服务器上的实际路径：
-
-```python
-chdir = '/你的项目路径/aichat'
-pidfile = '/你的项目路径/gunicorn.pid'
-accesslog = '/你的日志路径/gunicorn_access.log'
-errorlog = '/你的日志路径/gunicorn_error.log'
-user = '你的用户名'   # 可选
-```
-
-2. **启动**：
-
-```bash
-gunicorn -c gunicorn_conf.py main:app
-```
-
-### 配置 Nginx 反向代理
-
-以下配置中的 `your-domain.com` 请替换为**你自己的域名**（或服务器公网 IP）：
-
-```nginx
-server {
-    listen 80;
-    server_name your-domain.com;   # ← 改成你的域名或公网 IP
-
-    location / {
-        proxy_pass http://127.0.0.1:3210;
-        proxy_http_version 1.1;
-        proxy_set_header Upgrade $http_upgrade;
-        proxy_set_header Connection "upgrade";
-        proxy_set_header Host $host;
-        proxy_set_header X-Real-IP $remote_addr;
-        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
-        proxy_read_timeout 300s;    # AI 回复可能较慢，务必设大
-        proxy_send_timeout 300s;
-    }
-}
-```
-
-生效：
-
-```bash
-sudo nginx -t && sudo systemctl reload nginx
-```
-
-> **HTTPS**：建议用 [certbot](https://certbot.eff.org/) 为域名免费签发证书：
-> `sudo certbot --nginx -d your-domain.com`
-
-### uWSGI（不推荐）
-
-FastAPI 是 ASGI 应用，uWSGI 默认的 WSGI 模式**无法直接运行**。请优先使用 Docker 或 Gunicorn。若坚持用 uWSGI，需安装 `uwsgi[asgi]` 并使用 `--asgi` 模式，详见 uWSGI 官方文档；仓库中的 `uwsgi.ini` 仅供参考。
-
-### 宝塔面板部署
-
-1. 在宝塔面板中创建 Python 项目
-2. 项目路径指向本项目目录
-3. 运行文件选择 `main.py`
-4. 端口设为 `3210`
-5. 在面板中设置环境变量 `SECRET_KEY`
-6. 启动项目
-
-### 使用 systemd 设为开机自启
-
-创建 `/etc/systemd/system/aichat.service`：
-
-```ini
-[Unit]
-Description=个人学习实验台
-After=network.target
-
-[Service]
-Type=simple
-User=www
-WorkingDirectory=/你的项目路径/aichat
-Environment="SECRET_KEY=你的密钥"
-ExecStart=/你的项目路径/aichat/.venv/bin/gunicorn -c gunicorn_conf.py main:app
-Restart=always
-RestartSec=5
-
-[Install]
-WantedBy=multi-user.target
-```
-
-然后：
-
-```bash
-sudo systemctl daemon-reload
-sudo systemctl enable aichat
-sudo systemctl start aichat
-sudo systemctl status aichat   # 查看运行状态
 ```
 
 ## 常见启动错误
@@ -516,44 +399,24 @@ bcrypt.verify(password, row["password"])
 
 ```bash
 git pull origin main
-
-# 本地运行：若改了依赖
-pip install -r requirements.txt
-# 然后重启服务
-
-# Docker 部署：
-docker compose down && docker compose up -d --build
+# 依赖有变动时用 --no-cache 强制重建，确保装上新的依赖版本
+docker compose down
+docker compose build --no-cache
+docker compose up -d
 ```
+
+> 版本升级后首次启动会自动给数据库补充新列（`ALTER TABLE`），旧数据保留，无需手动操作。
 
 ### 备份数据
 
-只需要备份两个东西：
-
 ```bash
-# 1. 数据库（含用户、Key、聊天记录）—— 本地运行
-cp data.db data.db.bak.$(date +%Y%m%d)
-
-# 2. 环境变量
-cp .env .env.bak.$(date +%Y%m%d)
+# 数据库（含用户、Key、聊天记录）在宿主机的 ./data 目录
+docker compose down
+cp -r data "data.bak.$(date +%Y%m%d%H%M%S)"
+docker compose up -d
 ```
 
-**Docker 用户**：备份 `data/` 目录即可（见「数据持久化与备份」）。
-
-### 升级依赖
-
-```bash
-# 查看哪些依赖有新版本
-pip list --outdated
-
-# 逐个升级（推荐，避免兼容性问题）
-pip install --upgrade fastapi
-pip install --upgrade uvicorn
-
-# 生成新的 requirements.txt
-pip freeze > requirements.txt
-```
-
-> Docker 部署升级依赖后需重建镜像：`docker compose up -d --build`。
+> 彻底删除（含数据）才使用 `docker compose down -v`，请慎用。
 
 ### 清理旧数据
 
@@ -577,30 +440,28 @@ VACUUM;
 
 ## 部署检查清单
 
-### Docker 部署
-
 - [ ] 服务器已安装 Docker，`docker compose version` 有输出
 - [ ] `docker-compose.yml` 中 `SECRET_KEY` 已改为随机字符串（非占位符）
 - [ ] `docker compose up -d --build` 构建成功、容器状态为 `Up`
 - [ ] `docker compose logs aichat` 显示 `Uvicorn running on ...`
 - [ ] 浏览器能打开 `http://服务器公网IP:3210`（本机则用 localhost）
 - [ ] 云安全组 + 服务器防火墙已放行 3210/TCP
-- [ ] 能正常注册账号
+- [ ] 能正常注册账号（需填写 QQ）
 - [ ] 在设置页面填入了至少一个提供商的 API Key
 - [ ] 能正常发送消息并收到 AI 回复
+- [ ] 能正常绑定/修改 QQ，忘记密码可重置
 - [ ] 已完成 `data/` 目录的定期备份
-
-### 本地运行
-
-- [ ] Python 版本 ≥ 3.10
-- [ ] 已创建 `.env` 并设置了随机 `SECRET_KEY`
-- [ ] `pip install -r requirements.txt` 无报错
-- [ ] `python main.py` 能正常启动，显示 `Uvicorn running on ...`
-- [ ] 浏览器能打开 `http://localhost:3210`
 
 ## 安全声明
 
-本项目是一个**个人学习用途**的实验台，存在以下设计上的安全取舍：
+本项目是一个**个人学习用途**的实验台，已内置以下防护：
+
+- **访问限流** — 登录/注册/发送等接口按 IP/用户限流，超出返回 429
+- **CSRF 同源校验** — 写请求校验 Origin/Referer 与 Host 同源
+- **出站 TLS 校验** — 调用 AI 供应商 API 时校验服务器证书
+- **改密吊销会话** — 修改/重置密码后，旧登录凭证全部失效
+
+仍存在的**设计取舍**（未加密）：
 
 1. **密码明文存储** — 用户密码未经过 bcrypt/scrypt 哈希，直接以明文存入 SQLite
 2. **API Key 明文存储** — 各提供商的 API Key 以明文存入数据库
