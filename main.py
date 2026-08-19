@@ -8,9 +8,11 @@ import json
 import os
 import random
 import re
+import sqlite3
 import stat
 import time
 import uuid
+from collections import defaultdict, deque
 from datetime import datetime, timedelta
 from urllib.parse import urlparse
 
@@ -114,6 +116,31 @@ def _cleanup_blacklist():
         del TOKEN_BLACKLIST[k]
 
 # ============================================================
+# 简易内存限流（按 IP / 用户）
+# ============================================================
+_RATE_LIMITS = defaultdict(deque)   # key -> 最近请求时间戳队列
+
+def _client_ip(request: Request) -> str:
+    fwd = request.headers.get("x-forwarded-for")
+    if fwd:
+        return fwd.split(",")[0].strip()
+    return request.client.host if request.client else "unknown"
+
+def _rate_limit(key: str, limit: int, window: int):
+    """滑动窗口：window 秒内最多 limit 次，超出抛 429"""
+    now = time.time()
+    # 周期性清扫：key 过多时移除已超过 1 小时无活动的记录，避免内存无限增长
+    if len(_RATE_LIMITS) > 1000:
+        for k in [k for k, q in list(_RATE_LIMITS.items()) if not q or q[-1] <= now - 3600]:
+            del _RATE_LIMITS[k]
+    q = _RATE_LIMITS[key]
+    while q and q[0] <= now - window:
+        q.popleft()
+    if len(q) >= limit:
+        raise HTTPException(429, "操作过于频繁，请稍后再试")
+    q.append(now)
+
+# ============================================================
 # 数据库
 # ============================================================
 async def get_db() -> aiosqlite.Connection:
@@ -140,6 +167,8 @@ async def init_db():
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             username TEXT UNIQUE NOT NULL,
             password TEXT NOT NULL,
+            qq TEXT NOT NULL DEFAULT '',
+            pwd_changed_at INTEGER NOT NULL DEFAULT 0,
             created_at INTEGER NOT NULL
         );
         CREATE TABLE IF NOT EXISTS sessions (
@@ -194,6 +223,16 @@ async def init_db():
         await db.commit()
     except Exception:
         pass
+    try:
+        await db.execute("ALTER TABLE users ADD COLUMN qq TEXT NOT NULL DEFAULT ''")
+        await db.commit()
+    except Exception:
+        pass
+    try:
+        await db.execute("ALTER TABLE users ADD COLUMN pwd_changed_at INTEGER NOT NULL DEFAULT 0")
+        await db.commit()
+    except Exception:
+        pass
     await db.close()
 
     try:
@@ -204,11 +243,12 @@ async def init_db():
 # ============================================================
 # JWT
 # ============================================================
-def create_token(user_id: int) -> str:
+def create_token(user_id: int, pwd_changed_at: int) -> str:
     now = datetime.utcnow()
     exp = now + timedelta(seconds=JWT_EXPIRE_SECONDS)
     return jwt.encode({
         "user_id": user_id,
+        "pwd_ver": pwd_changed_at,
         "jti": str(uuid.uuid4()),
         "iat": now,
         "exp": exp,
@@ -235,6 +275,8 @@ async def get_current_user(request: Request) -> dict:
         row = await fetch_one(db, "SELECT * FROM users WHERE id=?", (data["user_id"],))
         if not row:
             raise HTTPException(401, "用户不存在")
+        if data.get("pwd_ver", 0) != row["pwd_changed_at"]:
+            raise HTTPException(401, "登录已过期，请重新登录")
         return row
     finally:
         await db.close()
@@ -285,6 +327,18 @@ def _verify_captcha(signed: str) -> bool:
 
 _USED_CAPTCHAS = set()
 
+def _verify_captcha_flow(captcha_signed: str, captcha_answer: str):
+    """校验并消耗验证码（供注册/找回密码共用）"""
+    if not captcha_signed or not captcha_answer:
+        raise HTTPException(400, "请输入验证码")
+    if not _verify_captcha(captcha_signed):
+        raise HTTPException(400, "验证码错误或已过期")
+    if captcha_answer.strip() != captcha_signed.split(":", 1)[1]:
+        raise HTTPException(400, "验证码答案错误")
+    if captcha_signed in _USED_CAPTCHAS:
+        raise HTTPException(400, "验证码已使用")
+    _USED_CAPTCHAS.add(captcha_signed)
+
 # ============================================================
 # 安全中间件
 # ============================================================
@@ -306,6 +360,24 @@ async def security_middleware(request: Request, call_next):
     return response
 
 @app.middleware("http")
+async def csrf_protect(request: Request, call_next):
+    """同源校验：写请求若携带 Origin/Referer 则必须与 Host 同主机，否则拒绝（CSRF 防护）。
+    仅比较主机名、忽略端口，兼容反向代理改写 Host 及 IPv6。"""
+    if request.method in ("POST", "PUT", "DELETE", "PATCH"):
+        host_header = request.headers.get("host", "")
+        host_name = (urlparse(f"//{host_header}").hostname or "").lower()
+        for h in (request.headers.get("origin"), request.headers.get("referer")):
+            if not h:
+                continue
+            try:
+                origin_name = (urlparse(h).hostname or "").lower()
+            except Exception:
+                origin_name = ""
+            if origin_name != host_name:
+                return JSONResponse({"detail": "跨站请求被拒绝"}, status_code=403)
+    return await call_next(request)
+
+@app.middleware("http")
 async def inject_user(request: Request, call_next):
     request.state.user = None
     token = request.cookies.get("token")
@@ -315,7 +387,7 @@ async def inject_user(request: Request, call_next):
             db = await get_db()
             try:
                 row = await fetch_one(db, "SELECT * FROM users WHERE id=?", (data["user_id"],))
-                if row:
+                if row and data.get("pwd_ver", 0) == row["pwd_changed_at"]:
                     request.state.user = row
             finally:
                 await db.close()
@@ -326,6 +398,7 @@ async def inject_user(request: Request, call_next):
 # ============================================================
 _USERNAME_RE = re.compile(r'^[\w\u4e00-\u9fff\-]{1,30}$')
 _MODEL_RE = re.compile(r'^[a-zA-Z0-9\-_\.]{1,64}$')
+_QQ_RE = re.compile(r'^\d{5,11}$')
 
 def _check_username(username: str):
     if not _USERNAME_RE.match(username):
@@ -334,6 +407,10 @@ def _check_username(username: str):
 def _check_password(password: str):
     if not password or len(password) > 128:
         raise HTTPException(400, "密码需要1-128个字符")
+
+def _check_qq(qq: str):
+    if not _QQ_RE.match(qq):
+        raise HTTPException(400, "QQ号格式不正确（5-11位数字）")
 
 def _check_message(message: str):
     if len(message) > 50000:
@@ -395,39 +472,36 @@ async def health():
 # 认证 API
 # ============================================================
 @app.get("/api/auth/captcha")
-async def get_captcha():
+async def get_captcha(request: Request):
+    _rate_limit(f"captcha:{_client_ip(request)}", 30, 60)
     question, signed = _gen_captcha()
     return JSONResponse({"question": question, "signed": signed})
 
 @app.post("/api/auth/signup")
 async def signup(request: Request, username: str = Form(...), password: str = Form(...),
-                 captcha_signed: str = Form(""), captcha_answer: str = Form(""),
+                 qq: str = Form(...), captcha_signed: str = Form(""), captcha_answer: str = Form(""),
                  honey: str = Form("")):
     username = username.strip()
+    qq = qq.strip()
     _check_username(username)
     _check_password(password)
+    _check_qq(qq)
+    _rate_limit(f"signup:{_client_ip(request)}", 5, 300)
     if honey:
         raise HTTPException(400, "注册失败，请重试")
-    if not captcha_signed or not captcha_answer:
-        raise HTTPException(400, "请输入验证码")
-    if not _verify_captcha(captcha_signed):
-        raise HTTPException(400, "验证码错误或已过期")
-    if captcha_answer.strip() != captcha_signed.split(":", 1)[1]:
-        raise HTTPException(400, "验证码答案错误")
-    if captcha_signed in _USED_CAPTCHAS:
-        raise HTTPException(400, "验证码已使用")
-    _USED_CAPTCHAS.add(captcha_signed)
+    _verify_captcha_flow(captcha_signed, captcha_answer)
     db = await get_db()
     try:
-        row = await fetch_one(db, "SELECT id FROM users WHERE username=?", (username,))
-        if row:
-            raise HTTPException(400, "注册失败，请尝试其他用户名")
         now = int(time.time())
-        cursor = await db.execute(
-            "INSERT INTO users (username, password, created_at) VALUES (?,?,?)", (username, password, now))
-        await db.commit()
+        try:
+            cursor = await db.execute(
+                "INSERT INTO users (username, password, qq, created_at, pwd_changed_at) VALUES (?,?,?,?,?)",
+                (username, password, qq, now, now))
+            await db.commit()
+        except sqlite3.IntegrityError:
+            raise HTTPException(400, "注册失败，请重试")
         user_id = cursor.lastrowid
-        token = create_token(user_id)
+        token = create_token(user_id, now)
         jti = jwt.decode(token, SECRET_KEY, algorithms=["HS256"])["jti"]
         await _enforce_session_limit(user_id, jti)
         resp = JSONResponse({"ok": True, "message": "注册成功"})
@@ -442,6 +516,9 @@ async def login(request: Request, username: str = Form(...), password: str = For
     username = username.strip()
     _check_username(username)
     _check_password(password)
+    ip = _client_ip(request)
+    _rate_limit(f"login:{ip}", 10, 300)
+    _rate_limit(f"login:{ip}:{username}", 5, 300)
     db = await get_db()
     try:
         row = await fetch_one(db, "SELECT * FROM users WHERE username=?", (username,))
@@ -449,7 +526,7 @@ async def login(request: Request, username: str = Form(...), password: str = For
             if not row:
                 _ = password + "unused_salt_for_timing"
             raise HTTPException(400, "用户名或密码错误")
-        token = create_token(row["id"])
+        token = create_token(row["id"], row["pwd_changed_at"])
         jti = jwt.decode(token, SECRET_KEY, algorithms=["HS256"])["jti"]
         await _enforce_session_limit(row["id"], jti)
         resp = JSONResponse({"ok": True, "message": "登录成功"})
@@ -510,6 +587,51 @@ async def delete_account(request: Request):
         resp = JSONResponse({"ok": True, "message": "账号已注销"})
         resp.delete_cookie("token")
         return resp
+    finally:
+        await db.close()
+
+@app.get("/api/auth/qq")
+async def get_qq(request: Request):
+    user = await get_current_user(request)
+    return JSONResponse({"qq": user["qq"]})
+
+@app.put("/api/auth/qq")
+async def update_qq(request: Request):
+    user = await get_current_user(request)
+    data = await request.json()
+    qq = (data.get("qq") or "").strip()
+    _check_qq(qq)
+    db = await get_db()
+    try:
+        await db.execute("UPDATE users SET qq=? WHERE id=?", (qq, user["id"]))
+        await db.commit()
+        return JSONResponse({"ok": True, "message": "QQ已更新"})
+    finally:
+        await db.close()
+
+@app.post("/api/auth/forgot-password")
+async def forgot_password(request: Request, username: str = Form(...), qq: str = Form(...),
+                          new_password: str = Form(...),
+                          captcha_signed: str = Form(""), captcha_answer: str = Form("")):
+    """忘记密码：校验 用户名+绑定的QQ+验证码 后重置密码"""
+    username = username.strip()
+    qq = qq.strip()
+    _check_username(username)
+    _check_password(new_password)
+    _check_qq(qq)
+    _rate_limit(f"forgot:{_client_ip(request)}", 5, 300)
+    _verify_captcha_flow(captcha_signed, captcha_answer)
+    db = await get_db()
+    try:
+        row = await fetch_one(db, "SELECT * FROM users WHERE username=?", (username,))
+        if not row or row["qq"] != qq:
+            raise HTTPException(400, "重置失败，请检查用户名与绑定的QQ")
+        now = int(time.time())
+        await db.execute("UPDATE users SET password=?, pwd_changed_at=? WHERE id=?",
+                         (new_password, now, row["id"]))
+        await db.execute("DELETE FROM sessions WHERE user_id=?", (row["id"],))
+        await db.commit()
+        return JSONResponse({"ok": True, "message": "密码已重置，请使用新密码登录"})
     finally:
         await db.close()
 
@@ -705,6 +827,7 @@ async def delete_message(msg_id: int, request: Request):
 @app.post("/api/chats/{chat_id}/send")
 async def send_message(chat_id: int, request: Request):
     user = await get_current_user(request)
+    _rate_limit(f"send:u{user['id']}", 30, 60)
 
     data = await request.json()
     message = (data.get("message") or "").strip()
@@ -771,12 +894,7 @@ async def send_message(chat_id: int, request: Request):
         try:
             if omitted:
                 yield f"data: {json.dumps({'notice': f'已省略更早的 {omitted} 条消息（如需完整上下文可新开对话）'})}\n\n"
-            import ssl
-            ssl_ctx = ssl.create_default_context()
-            ssl_ctx.check_hostname = False
-            ssl_ctx.verify_mode = ssl.CERT_NONE
-            connector = aiohttp.TCPConnector(ssl=ssl_ctx)
-            async with aiohttp.ClientSession(connector=connector) as session:
+            async with aiohttp.ClientSession() as session:
                 api_url = f"{base_url}/chat/completions"
                 headers = {
                     "Authorization": f"Bearer {api_key}",
