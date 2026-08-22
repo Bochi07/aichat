@@ -755,7 +755,6 @@ async def list_keys(request: Request):
                 "name": pinfo["name"],
                 "has_key": pid in key_map,
                 "api_key": key_map[pid]["api_key"] if pid in key_map else "",
-                "base_url": key_map[pid]["base_url"] if pid in key_map else "",
             }
         return JSONResponse(result)
     finally:
@@ -768,23 +767,19 @@ async def create_key(request: Request):
     data = await request.json()
     provider = (data.get("provider") or "").strip()
     api_key = (data.get("api_key") or "").strip()
-    base_url = (data.get("base_url") or "").strip()
     if provider not in PROVIDERS:
         raise HTTPException(400, "未知提供商")
     if not api_key:
         raise HTTPException(400, "访问密钥 不能为空")
     _check_api_key_format(api_key)
-    if base_url and not base_url.startswith(("http://", "https://")):
-        raise HTTPException(400, "接口地址(Base URL)格式不正确，需以 http(s):// 开头")
     db = await get_db()
     try:
         # 只允许 1 个 Key，新 Key 顶掉旧的
         await db.execute("DELETE FROM api_keys WHERE user_id=?", (user["id"],))
         now = int(time.time())
-        effective_base_url = base_url or PROVIDERS[provider]["base_url"]
         await db.execute(
             "INSERT INTO api_keys (user_id, provider, name, api_key, base_url, created_at) VALUES (?,?,?,?,?,?)",
-            (user["id"], provider, PROVIDERS[provider]["name"], api_key, effective_base_url, now))
+            (user["id"], provider, PROVIDERS[provider]["name"], api_key, PROVIDERS[provider]["base_url"], now))
         await db.commit()
         return JSONResponse({"ok": True, "message": f"{PROVIDERS[provider]['name']} Key 已保存"})
     finally:
