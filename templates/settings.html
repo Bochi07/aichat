@@ -15,16 +15,25 @@
 
     <div class="settings-section">
         <h2>访问密钥</h2>
-        <div style="display:flex;gap:8px;margin-bottom:10px">
-            <select id="provider-pick" class="model-select" style="min-width:110px"></select>
-            <input type="text" id="key-input" class="input" style="flex:1;font-size:14px" placeholder="输入访问密钥..." autocomplete="off">
-            <button class="btn btn-sm" onclick="saveKey()" style="background:var(--primary);color:#fff;white-space:nowrap">保存</button>
+        <div id="key-status" style="font-size:13px;color:#94a3b8;margin:0 0 10px"></div>
+
+        <div class="key-module">
+            <div style="display:flex;gap:8px;margin-bottom:6px">
+                <select id="provider-pick-1" class="model-select" style="min-width:110px"></select>
+                <input type="text" id="key-input-1" class="input" style="flex:1;font-size:14px" placeholder="输入访问密钥..." autocomplete="off">
+                <button class="btn btn-sm" onclick="saveKey(1)" style="background:var(--primary);color:#fff;white-space:nowrap">保存</button>
+            </div>
+            <div id="key-status-1" style="font-size:13px;color:#94a3b8;margin-top:4px"></div>
         </div>
-        <div id="key-status" style="font-size:13px;color:#94a3b8;margin-top:6px"></div>
-        <div id="key-detail" style="display:none;margin-top:8px;padding:8px 12px;background:#f0fdf4;border-radius:8px;font-size:13px">
-            <span id="key-provider-name"></span>
-            <span id="key-full" style="font-family:monospace;word-break:break-all;display:block;margin-top:4px;color:#166534"></span>
-            <button class="btn btn-sm" onclick="deleteCurKey()" style="margin-top:6px;background:#ef4444;color:#fff">删除此密钥</button>
+
+        <div class="key-module" style="border-top:1px solid #e2e8f0;margin-top:14px;padding-top:12px">
+            <h3 style="font-size:14px;margin:0 0 6px;color:#334155">额外密钥</h3>
+            <div style="display:flex;gap:8px;margin-bottom:6px">
+                <select id="provider-pick-2" class="model-select" style="min-width:110px"></select>
+                <input type="text" id="key-input-2" class="input" style="flex:1;font-size:14px" placeholder="输入访问密钥..." autocomplete="off">
+                <button class="btn btn-sm" onclick="saveKey(2)" style="background:var(--primary);color:#fff;white-space:nowrap">保存</button>
+            </div>
+            <div id="key-status-2" style="font-size:13px;color:#94a3b8;margin-top:4px"></div>
         </div>
     </div>
 
@@ -65,24 +74,58 @@
 
 <script>
 const PROVIDER_IDS=['deepseek','qwen','ernie','mimo'];
-let PROVIDER_INFO={},keysData={},curProvider=null;
+let PROVIDER_INFO={},keysData={};
+
+function hasKey(pid){return !!(keysData[pid]&&keysData[pid].has_key);}
+
+function initModule(n,excludePid){
+    const sel=document.getElementById('provider-pick-'+n);
+    const others=p=>p!==excludePid;
+    let chosen=PROVIDER_IDS.find(p=>others(p)&&hasKey(p));   // 优先选已配置的厂商
+    if(!chosen)chosen=PROVIDER_IDS.find(p=>others(p));        // 否则选任意其他厂商
+    if(!chosen)chosen=PROVIDER_IDS[0];
+    sel.innerHTML=PROVIDER_IDS.map(p=>`<option value="${p}" ${p===chosen?'selected':''}>${(PROVIDER_INFO[p]||{}).name||p}</option>`).join('');
+    sel.onchange=()=>updateModuleStatus(n);
+    updateModuleStatus(n);
+}
+
+function updateModuleStatus(n){
+    const sel=document.getElementById('provider-pick-'+n);
+    const pid=sel?sel.value:PROVIDER_IDS[0];
+    const name=(PROVIDER_INFO[pid]||{}).name||pid;
+    const st=document.getElementById('key-status-'+n);
+    st.innerHTML=hasKey(pid)?name+'：✅ 已配置 <button class="btn btn-sm" onclick="deleteKeyFrom('+n+')" style="background:#ef4444;color:#fff;margin-left:6px">删除</button>':name+'：未配置';
+}
+
+function updateGlobalStatus(){
+    const parts=PROVIDER_IDS.map(pid=>hasKey(pid)?(PROVIDER_INFO[pid]||{}).name||pid:'').filter(Boolean);
+    document.getElementById('key-status').textContent=parts.length?'已配置：'+parts.join(' | '):'暂未配置访问密钥';
+}
 
 async function loadInfo(){
     const[provResp,keysResp,meResp]=await Promise.all([fetch('api/providers'),fetch('api/keys'),fetch('api/auth/me')]);
     PROVIDER_INFO=await provResp.json();keysData=await keysResp.json();
-    for(const pid of PROVIDER_IDS){if(keysData[pid]&&keysData[pid].has_key){curProvider=pid;break;}}
-    document.getElementById('provider-pick').innerHTML=PROVIDER_IDS.map(pid=>`<option value="${pid}" ${pid===curProvider?'selected':''}>${(PROVIDER_INFO[pid]||{}).name||pid}</option>`).join('');
-    updateStatus();
-    if(curProvider){showDetail(curProvider);document.getElementById('key-input').style.display='none';document.querySelector('#provider-pick').parentElement.querySelector('.btn').style.display='none';}
+    updateGlobalStatus();
+    initModule(1,null);
+    initModule(2,document.getElementById('provider-pick-1').value);
     document.getElementById('account-name').textContent=meResp.ok?(await meResp.json()).username:'已登录';
 }
-function updateStatus(){
-    const parts=PROVIDER_IDS.map(pid=>{const n=(PROVIDER_INFO[pid]||{}).name||pid;return keysData[pid]&&keysData[pid].has_key?n+' ✅':'';}).filter(Boolean);
-    document.getElementById('key-status').textContent=parts.length?'已配置：'+parts.join(' | '):'暂未配置访问密钥';
+
+async function saveKey(n){
+    const pid=document.getElementById('provider-pick-'+n).value;
+    const api_key=document.getElementById('key-input-'+n).value.trim();
+    if(!api_key)return alert('请输入访问密钥');
+    const resp=await fetch('api/keys',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({provider:pid,api_key})});
+    if(resp.ok){alert('已保存');location.reload();}else alert((await resp.json()).detail||'失败');
 }
-function showDetail(pid){document.getElementById('key-detail').style.display='block';document.getElementById('key-provider-name').textContent=(PROVIDER_INFO[pid]||{}).name||pid;document.getElementById('key-full').textContent=keysData[pid]?keysData[pid].api_key:'';}
-async function saveKey(){const pid=document.getElementById('provider-pick').value,api_key=document.getElementById('key-input').value.trim();if(!api_key)return alert('请输入访问密钥');const resp=await fetch('api/keys',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({provider:pid,api_key})});if(resp.ok){alert('已保存');location.reload();}else alert((await resp.json()).detail||'失败');}
-async function deleteCurKey(){if(!curProvider||!confirm('确定删除此访问密钥？'))return;await fetch('api/keys/'+curProvider,{method:'DELETE'});location.reload();}
+
+async function deleteKeyFrom(n){
+    const pid=document.getElementById('provider-pick-'+n).value;
+    const name=(PROVIDER_INFO[pid]||{}).name||pid;
+    if(!confirm('确定删除 '+name+' 的访问密钥？'))return;
+    const resp=await fetch('api/keys/'+pid,{method:'DELETE'});
+    if(resp.ok)location.reload();else alert((await resp.json()).detail||'失败');
+}
 
 async function changePassword(e){e.preventDefault();const pwd=document.getElementById('new-password').value.trim();if(!pwd)return;const msg=document.getElementById('pwd-msg'),resp=await fetch('api/auth/password',{method:'PUT',headers:{'Content-Type':'application/json'},body:JSON.stringify({password:pwd})}),data=await resp.json();msg.style.display='block';msg.style.fontSize='13px';msg.style.marginTop='6px';msg.style.color=resp.ok?'#16a34a':'#dc2626';msg.textContent=data.message||data.detail||'失败';if(resp.ok){document.getElementById('new-password').value='';setTimeout(()=>{window.location.href='login';},1200);}}
 
