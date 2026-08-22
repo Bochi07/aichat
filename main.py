@@ -762,7 +762,7 @@ async def list_keys(request: Request):
 
 @app.post("/api/keys")
 async def create_key(request: Request):
-    """保存某个提供商的 Key"""
+    """保存某个提供商的 Key（各厂商独立保存，互不影响）"""
     user = await get_current_user(request)
     data = await request.json()
     provider = (data.get("provider") or "").strip()
@@ -774,14 +774,23 @@ async def create_key(request: Request):
     _check_api_key_format(api_key)
     db = await get_db()
     try:
-        # 只允许 1 个 Key，新 Key 顶掉旧的
-        await db.execute("DELETE FROM api_keys WHERE user_id=?", (user["id"],))
         now = int(time.time())
-        await db.execute(
-            "INSERT INTO api_keys (user_id, provider, name, api_key, base_url, created_at) VALUES (?,?,?,?,?,?)",
-            (user["id"], provider, PROVIDERS[provider]["name"], api_key, PROVIDERS[provider]["base_url"], now))
+        name = PROVIDERS[provider]["name"]
+        base_url = PROVIDERS[provider]["base_url"]
+        # 该厂商已有 Key 则更新，否则新增；不影响其他厂商已保存的 Key
+        existing = await fetch_one(db,
+            "SELECT id FROM api_keys WHERE user_id=? AND provider=?",
+            (user["id"], provider))
+        if existing:
+            await db.execute(
+                "UPDATE api_keys SET api_key=?, name=?, base_url=?, created_at=? WHERE id=?",
+                (api_key, name, base_url, now, existing["id"]))
+        else:
+            await db.execute(
+                "INSERT INTO api_keys (user_id, provider, name, api_key, base_url, created_at) VALUES (?,?,?,?,?,?)",
+                (user["id"], provider, name, api_key, base_url, now))
         await db.commit()
-        return JSONResponse({"ok": True, "message": f"{PROVIDERS[provider]['name']} Key 已保存"})
+        return JSONResponse({"ok": True, "message": f"{name} Key 已保存"})
     finally:
         await db.close()
 
