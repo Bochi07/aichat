@@ -62,8 +62,8 @@ PROVIDERS = {
     "mimo": {
         "name": "小米 MiLM",
         "base_url": "https://api.xiaomimimo.com/v1",
-        "models": ["mimo-v2-flash", "mimo-v2-pro", "mimo-v2.5-pro"],
-        "default_model": "mimo-v2-flash",
+        "models": ["mimo-v2.5-pro", "mimo-v2.5"],
+        "default_model": "mimo-v2.5-pro",
     },
 }
 
@@ -90,6 +90,7 @@ MODEL_CONTEXT_TOKENS = {
     "ernie-lite-8k": 8192,
     "mimo-v2-flash": 32768,
     "mimo-v2-pro": 32768,
+    "mimo-v2.5": 32768,
     "mimo-v2.5-pro": 32768,
 }
 
@@ -754,6 +755,7 @@ async def list_keys(request: Request):
                 "name": pinfo["name"],
                 "has_key": pid in key_map,
                 "api_key": key_map[pid]["api_key"] if pid in key_map else "",
+                "base_url": key_map[pid]["base_url"] if pid in key_map else "",
             }
         return JSONResponse(result)
     finally:
@@ -766,19 +768,23 @@ async def create_key(request: Request):
     data = await request.json()
     provider = (data.get("provider") or "").strip()
     api_key = (data.get("api_key") or "").strip()
+    base_url = (data.get("base_url") or "").strip()
     if provider not in PROVIDERS:
         raise HTTPException(400, "未知提供商")
     if not api_key:
         raise HTTPException(400, "访问密钥 不能为空")
     _check_api_key_format(api_key)
+    if base_url and not base_url.startswith(("http://", "https://")):
+        raise HTTPException(400, "接口地址(Base URL)格式不正确，需以 http(s):// 开头")
     db = await get_db()
     try:
         # 只允许 1 个 Key，新 Key 顶掉旧的
         await db.execute("DELETE FROM api_keys WHERE user_id=?", (user["id"],))
         now = int(time.time())
+        effective_base_url = base_url or PROVIDERS[provider]["base_url"]
         await db.execute(
             "INSERT INTO api_keys (user_id, provider, name, api_key, base_url, created_at) VALUES (?,?,?,?,?,?)",
-            (user["id"], provider, PROVIDERS[provider]["name"], api_key, PROVIDERS[provider]["base_url"], now))
+            (user["id"], provider, PROVIDERS[provider]["name"], api_key, effective_base_url, now))
         await db.commit()
         return JSONResponse({"ok": True, "message": f"{PROVIDERS[provider]['name']} Key 已保存"})
     finally:
@@ -977,6 +983,13 @@ async def send_message(chat_id: int, request: Request):
     # 动态上下文：按模型窗口尽可能保留全部历史，
     # 只有总 token 超出窗口（扣除 system_prompt 与回复预留）时才从最旧开始丢弃
     system_prompt = chat_row.get("system_prompt", "")
+    # 小米官方强烈建议：未设置实验参数时，注入带当前日期与知识截止日期的默认系统提示词
+    if not system_prompt and provider == "mimo":
+        _now = datetime.now()
+        _weekdays = ["星期一", "星期二", "星期三", "星期四", "星期五", "星期六", "星期日"]
+        system_prompt = (f"你是MiMo（中文名称也是MiMo），是小米公司研发的AI智能助手。"
+                         f"今天的日期：{_now.strftime('%Y年%m月%d日')} {_weekdays[_now.weekday()]}，"
+                         f"你的知识截止日期是2024年12月。")
     context_window = _get_context_window(model)
     budget = context_window - OUTPUT_RESERVE_TOKENS - _estimate_tokens(system_prompt)
     kept = []
@@ -1023,7 +1036,8 @@ async def send_message(chat_id: int, request: Request):
                     # 让流式响应的最后一个 chunk 携带 usage（真实 token 计数）
                     payload["stream_options"] = {"include_usage": True}
                 if provider == "mimo":
-                    payload["enable_thinking"] = deep_thinking
+                    # 小米 MiMo 官方格式：thinking.type = enabled / disabled
+                    payload["thinking"] = {"type": "enabled" if deep_thinking else "disabled"}
                 if provider == "qwen":
                     payload["enable_thinking"] = deep_thinking
                 async with session.post(api_url, json=payload, headers=headers,
@@ -1049,7 +1063,10 @@ async def send_message(chat_id: int, request: Request):
                                 if chunk_data.get("usage"):
                                     usage_capture["in"] = (chunk_data["usage"] or {}).get("prompt_tokens")
                                     usage_capture["out"] = (chunk_data["usage"] or {}).get("completion_tokens")
-                                delta = chunk_data.get("choices", [{}])[0].get("delta", {})
+                                choices = chunk_data.get("choices") or []
+                                if not choices:
+                                    continue   # 空 choices（如流式末尾的 usage 块），跳过内容解析
+                                delta = choices[0].get("delta", {})
                                 content = delta.get("content", "")
                                 reasoning = delta.get("reasoning_content", "")
                                 if reasoning:
