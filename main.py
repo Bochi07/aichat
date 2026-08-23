@@ -20,7 +20,10 @@ from urllib.parse import urlparse
 import aiohttp
 import jwt
 import aiosqlite
-import tiktoken
+try:
+    import tiktoken
+except ImportError:
+    tiktoken = None
 from fastapi import FastAPI, Request, HTTPException, Form
 from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
@@ -1167,7 +1170,7 @@ async def send_message(chat_id: int, request: Request):
 
     # 本次实际发送的上下文 token 与窗口占用百分比
     prompt_est = used + _estimate_tokens(system_prompt) + current_msg_estimate
-    window_pct = min(100.0, (prompt_est + OUTPUT_RESERVE_TOKENS) / context_window * 100)
+    window_pct = min(100.0, (prompt_est + output_reserve) / context_window * 100)
 
     openai_messages = []
     if system_prompt:
