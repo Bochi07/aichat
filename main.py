@@ -20,6 +20,7 @@ from urllib.parse import urlparse
 import aiohttp
 import jwt
 import aiosqlite
+import tiktoken
 from fastapi import FastAPI, Request, HTTPException, Form
 from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
@@ -76,37 +77,139 @@ PROVIDERS = {
 MODEL_CONTEXT_TOKENS = {
     "deepseek-v4-pro": 1_000_000,
     "deepseek-v4-flash": 1_000_000,
-    "qwen3.7-max": 32768, "qwen-max": 32768,
-    "qwen3.7-plus": 131072, "qwen-plus": 131072,
-    "qwen3.6-flash": 131072, "qwen-flash": 131072,
-    "qwen-long-latest": 262144,
-    "ernie-5.1": 131072,
-    "ernie-4.5-turbo-128k-preview": 131072,
-    "ernie-4.0-turbo-128k": 131072,
-    "ernie-4.0-turbo-8k": 8192,
-    "ernie-3.5-8k": 8192,
-    "ernie-speed-8k": 8192,
-    "ernie-speed-128k": 131072,
-    "ernie-lite-8k": 8192,
-    "mimo-v2-flash": 32768,
-    "mimo-v2-pro": 32768,
-    "mimo-v2.5": 32768,
-    "mimo-v2.5-pro": 32768,
+    "qwen3.7-max": 1_000_000, "qwen-max": 1_000_000,
+    "qwen3.7-plus": 1_000_000, "qwen-plus": 1_000_000,
+    "qwen3.6-flash": 1_000_000, "qwen-flash": 1_000_000,
+    "qwen-long-latest": 1_000_000,
+    "ernie-5.1": 1_000_000,
+    "ernie-4.5-turbo-128k-preview": 1_000_000,
+    "ernie-4.0-turbo-128k": 1_000_000,
+    "ernie-4.0-turbo-8k": 1_000_000,
+    "ernie-3.5-8k": 1_000_000,
+    "ernie-speed-8k": 1_000_000,
+    "ernie-speed-128k": 1_000_000,
+    "ernie-lite-8k": 1_000_000,
+    "mimo-v2-flash": 1_000_000,
+    "mimo-v2-pro": 1_000_000,
+    "mimo-v2.5": 1_000_000,
+    "mimo-v2.5-pro": 1_000_000,
 }
 
 def _get_context_window(model: str) -> int:
     """返回指定模型的上下文窗口 token 数"""
     return MODEL_CONTEXT_TOKENS.get(model, CONTEXT_FALLBACK_TOKENS)
 
+# re 模块已在文件顶部导入
+
+_CN_CHAR_RE = re.compile(r'[一-鿿㐀-䶿]')          # CJK 统一汉字
+_CN_PUNC_RE = re.compile(r'[　-〿＀-￯ -⁯]')  # 中文标点 + 全角字符
+_WORD_RE = re.compile(r'[a-zA-Z]+(?:\'[a-zA-Z]+)*')                 # 英文单词
+_NUM_RE = re.compile(r'\d+(?:\.\d+)?')                              # 数字
+_OTHER_RE = re.compile(r'[^a-zA-Z\d一-鿿㐀-䶿　-〿＀-￯ -⁯\s]')
+
+# 初始化 tiktoken 编码器（cl100k_base 适用于主流模型）
+try:
+    _TIKTOKEN_ENC = tiktoken.get_encoding("cl100k_base")
+except Exception:
+    _TIKTOKEN_ENC = None
+
 def _estimate_tokens(text: str) -> int:
-    """粗略估算文本 token 数（中英混合）。
-    中文按 ~0.75 token/字、其他字符按 ~0.28 token/字符，
-    再上浮 10% 作为安全余量，避免超出模型上下文窗口。"""
+    """使用 tiktoken 精确计算 token 数（cl100k_base 编码）。
+    若 tiktoken 不可用，回退到本地估算。"""
     if not text:
         return 0
-    cn = sum(1 for ch in text if ord(ch) > 0x2E80)
-    other = len(text) - cn
-    return max(1, int((cn * 0.75 + other * 0.28) * 1.1))
+    if _TIKTOKEN_ENC:
+        try:
+            return len(_TIKTOKEN_ENC.encode(text))
+        except Exception:
+            pass
+    # 回退：本地估算（中英混合场景）
+    cn_chars = len(_CN_CHAR_RE.findall(text))
+    cn_punc = len(_CN_PUNC_RE.findall(text))
+    words = len(_WORD_RE.findall(text))
+    nums = len(_NUM_RE.findall(text))
+    all_alpha_num = sum(len(w) for w in _WORD_RE.findall(text))
+    all_num = sum(len(n) for n in _NUM_RE.findall(text))
+    other_chars = len(text) - cn_chars - cn_punc - all_alpha_num - all_num
+    other_chars = max(0, other_chars)
+    est = cn_chars * 1.5 + cn_punc * 0.5 + words * 1.3 + nums * 0.5 + other_chars * 0.3
+    return max(1, int(est * 1.02))
+
+# ============================================================
+# AI 回复压缩（节省上下文空间）
+# ============================================================
+# 超过此 token 数的 AI 回复会被压缩存储
+CONDENSE_THRESHOLD_TOKENS = 300
+# 上下文拼装时：最近 N 条消息保持完整，更早的用压缩版
+CONDENSED_KEEP_RECENT = 50
+
+_CODE_BLOCK_RE = re.compile(r'```[\s\S]*?```', re.MULTILINE)
+ULLET_RE = re.compile(r'^[\s\-\*\·\•\▶\►]+\s*.+', re.MULTILINE)
+
+def _condense_text(text: str) -> str:
+    """压缩长文本，提取关键信息（代码块 + 要点 + 结论）。
+    目标：保留原始 50-60% 的内容，省 40-50% token（更保守的压缩）。"""
+    if not text:
+        return ""
+    est_tokens = _estimate_tokens(text)
+    if est_tokens < CONDENSE_THRESHOLD_TOKENS:
+        return text  # 短文本不压缩
+
+    # 1. 提取所有代码块（保留完整）
+    code_blocks = _CODE_BLOCK_RE.findall(text)
+    code_text = "\n\n".join(code_blocks) if code_blocks else ""
+
+    # 2. 去掉代码块后的纯文本
+    plain = _CODE_BLOCK_RE.sub("", text).strip()
+
+    # 3. 提取要点列表（以 -、*、数字开头的行）
+    lines = plain.split("\n")
+    bullet_lines = []
+    for line in lines:
+        stripped = line.strip()
+        if stripped and stripped[0] in "-*·•▶►" or re.match(r'^\d+[\.\)、]', stripped):
+            bullet_lines.append(stripped)
+    bullets_text = "\n".join(bullet_lines) if bullet_lines else ""
+
+    # 4. 取最后几段作为结论（最后 3 段非空段落，增加保留量）
+    paragraphs = [p.strip() for p in plain.split("\n\n") if p.strip()]
+    conclusion = "\n\n".join(paragraphs[-3:]) if len(paragraphs) > 3 else ""
+
+    # 5. 组装压缩版
+    parts = []
+    if bullets_text:
+        parts.append(bullets_text)
+    if conclusion and conclusion != bullets_text:
+        parts.append(conclusion)
+    if code_text:
+        parts.append(code_text)
+
+    condensed = "\n\n".join(parts) if parts else plain[:800]
+
+    # 如果压缩后还是太长，截断到最后一个完整段落（保留 60%）
+    if _estimate_tokens(condensed) > est_tokens * 0.6:
+        condensed = plain[:int(len(plain) * 0.6)]
+
+    return condensed if condensed else text[:800]
+
+def _condense_system_prompt(sp: str) -> str:
+    """上下文紧张时精简 system_prompt，只保留核心指令。"""
+    if not sp:
+        return ""
+    lines = sp.strip().split("\n")
+    # 保留非空行，去掉空行和重复说明
+    kept = []
+    seen = set()
+    for line in lines:
+        stripped = line.strip()
+        if stripped and stripped not in seen:
+            kept.append(stripped)
+            seen.add(stripped)
+    # 如果精简后还是太长，只保留前 500 字符
+    result = "\n".join(kept)
+    if _estimate_tokens(result) > 500:
+        result = result[:500]
+    return result
 
 # ============================================================
 # 配置
@@ -126,8 +229,9 @@ os.makedirs(DATA_DIR, exist_ok=True)
 DB_PATH = os.path.join(DATA_DIR, "data.db")
 JWT_EXPIRE_SECONDS = 7 * 24 * 3600
 MAX_SESSIONS = 5
-OUTPUT_RESERVE_TOKENS = 4096      # 给模型回复预留的输出 token 数
-CONTEXT_FALLBACK_TOKENS = 32768   # 未在 MODEL_CONTEXT_TOKENS 中列出的模型默认窗口
+OUTPUT_RESERVE_TOKENS_BASE = 1024   # 输出预留基础值（动态调整）
+CONTEXT_FALLBACK_TOKENS = 1_000_000   # 未列出的模型默认窗口（统一 1M）
+CONTEXT_SAFETY_BUFFER = 200          # 安全余量（降低以最大化利用上下文）
 
 if not SECRET_KEY:
     raise RuntimeError(
@@ -245,6 +349,7 @@ async def init_db():
             chat_id INTEGER NOT NULL,
             role TEXT NOT NULL,
             content TEXT NOT NULL,
+            condensed TEXT NOT NULL DEFAULT '',
             reasoning TEXT NOT NULL DEFAULT '',
             tokens_in INTEGER NOT NULL DEFAULT 0,
             tokens_out INTEGER NOT NULL DEFAULT 0,
@@ -284,6 +389,11 @@ async def init_db():
         pass
     try:
         await db.execute("ALTER TABLE users ADD COLUMN pwd_changed_at INTEGER NOT NULL DEFAULT 0")
+        await db.commit()
+    except Exception:
+        pass
+    try:
+        await db.execute("ALTER TABLE messages ADD COLUMN condensed TEXT NOT NULL DEFAULT ''")
         await db.commit()
     except Exception:
         pass
@@ -995,20 +1105,68 @@ async def send_message(chat_id: int, request: Request):
                          f"今天的日期：{_now.strftime('%Y年%m月%d日')} {_weekdays[_now.weekday()]}，"
                          f"你的知识截止日期是2024年12月。")
     context_window = _get_context_window(model)
-    budget = context_window - OUTPUT_RESERVE_TOKENS - _estimate_tokens(system_prompt)
+    rescued_count = 0
+
+    # 计算每条消息的 token 成本：优先用 API 返回的真实值，兜底用估算
+    def _msg_cost(m):
+        real = m.get("tokens_in")
+        if real and real > 0:
+            return real
+        return _estimate_tokens(m.get("content") or "")
+
+    # 动态计算输出预留：根据历史回复长度，取 1.2 倍或基础值的较大者
+    recent_replies = [m for m in history[-20:] if m.get("role") == "assistant" and m.get("tokens_out")]
+    if recent_replies:
+        avg_reply_tokens = sum(m["tokens_out"] for m in recent_replies) / len(recent_replies)
+        output_reserve = max(OUTPUT_RESERVE_TOKENS_BASE, int(avg_reply_tokens * 1.2))
+    else:
+        output_reserve = OUTPUT_RESERVE_TOKENS_BASE
+
+    # 预留给当前轮新消息 + system_prompt + 安全余量
+    current_msg_estimate = _estimate_tokens(message)
+    sp_estimate = _estimate_tokens(system_prompt)
+    budget = context_window - output_reserve - sp_estimate - current_msg_estimate - CONTEXT_SAFETY_BUFFER
+
+    # 第一轮：用真实 token 数尝试拼装（从最新消息往前）
     kept = []
     used = 0
     for m in reversed(history):
-        cost = _estimate_tokens(m.get("content") or "")
+        cost = _msg_cost(m)
         if kept and used + cost > budget:
             break
         kept.append(m)
         used += cost
     kept.reverse()
+
+    # 第二轮：如果被省略了消息，尝试用压缩版塞回更多（最多占 budget 的 40%）
+    if len(kept) < len(history):
+        dropped = history[:len(history) - len(kept)]
+        rescued = []
+        rescue_used = 0
+        rescue_budget = budget * 0.4  # 提高到 40%，塞回更多历史
+        for m in dropped:
+            content = m.get("condensed") or _condense_text(m.get("content") or "")
+            cost = _estimate_tokens(content)
+            if rescue_used + cost > rescue_budget:
+                break
+            rescued.append({"role": m["role"], "content": content})
+            rescue_used += cost
+        rescued.reverse()
+        kept = rescued + kept
+        used += rescue_used
+        rescued_count = len(rescued)
+
+    # 第三轮：如果还是塞不下，精简 system_prompt
+    if used > budget * 0.95:
+        condensed_sp = _condense_system_prompt(system_prompt)
+        sp_saved = sp_estimate - _estimate_tokens(condensed_sp)
+        budget += sp_saved
+        system_prompt = condensed_sp
+
     omitted = len(history) - len(kept)
 
-    # 本次实际发送的上下文 token（估算）与窗口占用百分比
-    prompt_est = used + _estimate_tokens(system_prompt)
+    # 本次实际发送的上下文 token 与窗口占用百分比
+    prompt_est = used + _estimate_tokens(system_prompt) + current_msg_estimate
     window_pct = min(100.0, (prompt_est + OUTPUT_RESERVE_TOKENS) / context_window * 100)
 
     openai_messages = []
@@ -1017,93 +1175,163 @@ async def send_message(chat_id: int, request: Request):
     for m in kept:
         openai_messages.append({"role": m["role"], "content": m["content"]})
 
+    # 上下文溢出关键词检测
+    _CTX_OVERFLOW_RE = re.compile(
+        r'context.{0,10}(length|window|exceed|limit|too|max)|'
+        r'token.{0,10}(limit|exceed|too|max)|'
+        r'prompt.{0,10}(too.long|exceed)|'
+        r'request.{0,10}too.large',
+        re.IGNORECASE
+    )
+
+    def _is_context_overflow(status: int, body: str) -> bool:
+        """检测是否为上下文溢出错误"""
+        if status in (400, 413):
+            return bool(_CTX_OVERFLOW_RE.search(body))
+        return False
+
     async def stream_response():
         collected = ""
         reasoning_text = ""
         error_msg = ""
         usage_capture = {}   # 上游若返回 usage 则记录真实 token 数
+        success = False      # 是否成功获得响应
+
+        # 自动回退：当前发送的消息列表（可能因重试而缩减）
+        current_messages = list(openai_messages)
+        dropped_notice = ""  # 累计的丢弃提示
+
         try:
             if omitted:
-                yield f"data: {json.dumps({'notice': f'对话较长，为适配模型上下文窗口已省略更早的 {omitted} 条消息'})}\n\n"
+                dropped_notice = f'对话较长，为适配模型上下文窗口已省略更早的 {omitted} 条消息'
+
             async with aiohttp.ClientSession() as session:
                 api_url = f"{base_url}/chat/completions"
                 headers = {
                     "Authorization": f"Bearer {api_key}",
                     "Content-Type": "application/json",
                 }
-                payload = {"model": model, "messages": openai_messages, "stream": True}
-                # 深度分析开关：开 = 深度思考，关 = 快速回答（显式关闭思考）
-                if provider == "deepseek":
-                    payload["thinking"] = {"type": "enabled" if deep_thinking else "disabled"}
-                    if deep_thinking:
-                        payload["reasoning_effort"] = "high"
-                    # 让流式响应的最后一个 chunk 携带 usage（真实 token 计数）
-                    payload["stream_options"] = {"include_usage": True}
-                if provider == "mimo":
-                    # 小米 MiMo 官方格式：thinking.type = enabled / disabled
-                    payload["thinking"] = {"type": "enabled" if deep_thinking else "disabled"}
-                if provider == "qwen":
-                    payload["enable_thinking"] = deep_thinking
-                async with session.post(api_url, json=payload, headers=headers,
-                                        timeout=aiohttp.ClientTimeout(total=300)) as resp:
-                    if resp.status != 200:
-                        try:
-                            err_body = await resp.text()
-                            err_text = err_body[:500]
-                        except Exception:
-                            err_text = f"HTTP {resp.status}"
-                        error_msg = f"[{resp.status}] {err_text}"
-                        yield f"data: {json.dumps({'error': error_msg})}\n\n"
-                        yield "data: [DONE]\n\n"
-                        return
-                    async for raw_line in resp.content:
-                        line = raw_line.decode("utf-8").strip()
-                        if line.startswith("data: "):
-                            chunk = line[6:]
-                            if chunk == "[DONE]":
-                                break
+
+                # 重试循环：遇到上下文溢出时自动缩减消息重试
+                MAX_RETRIES = 5
+                for retry in range(MAX_RETRIES + 1):
+                    payload = {"model": model, "messages": current_messages, "stream": True}
+                    # 深度分析开关：开 = 深度思考，关 = 快速回答（显式关闭思考）
+                    if provider == "deepseek":
+                        payload["thinking"] = {"type": "enabled" if deep_thinking else "disabled"}
+                        if deep_thinking:
+                            payload["reasoning_effort"] = "high"
+                        # 让流式响应的最后一个 chunk 携带 usage（真实 token 计数）
+                        payload["stream_options"] = {"include_usage": True}
+                    if provider == "mimo":
+                        # 小米 MiMo 官方格式：thinking.type = enabled / disabled
+                        payload["thinking"] = {"type": "enabled" if deep_thinking else "disabled"}
+                    if provider == "qwen":
+                        payload["enable_thinking"] = deep_thinking
+
+                    async with session.post(api_url, json=payload, headers=headers,
+                                            timeout=aiohttp.ClientTimeout(total=300)) as resp:
+                        if resp.status != 200:
                             try:
-                                chunk_data = json.loads(chunk)
-                                if chunk_data.get("usage"):
-                                    usage_capture["in"] = (chunk_data["usage"] or {}).get("prompt_tokens")
-                                    usage_capture["out"] = (chunk_data["usage"] or {}).get("completion_tokens")
-                                choices = chunk_data.get("choices") or []
-                                if not choices:
-                                    continue   # 空 choices（如流式末尾的 usage 块），跳过内容解析
-                                delta = choices[0].get("delta", {})
-                                content = delta.get("content", "")
-                                reasoning = delta.get("reasoning_content", "")
-                                if reasoning:
-                                    reasoning_text += reasoning
-                                    yield f"data: {json.dumps({'reasoning': reasoning})}\n\n"
-                                if content:
-                                    collected += content
-                                    yield f"data: {json.dumps({'content': content})}\n\n"
-                            except json.JSONDecodeError:
-                                continue
+                                err_body = await resp.text()
+                                err_text = err_body[:500]
+                            except Exception:
+                                err_text = f"HTTP {resp.status}"
+
+                            # 检测上下文溢出 → 自动缩减消息重试
+                            if _is_context_overflow(resp.status, err_text) and retry < MAX_RETRIES:
+                                sys_msgs = [m for m in current_messages if m["role"] == "system"]
+                                non_sys = [m for m in current_messages if m["role"] != "system"]
+                                if len(non_sys) <= 2:
+                                    break  # 只剩最后一条用户消息，放弃
+                                drop_count = max(1, len(non_sys) // 2)
+                                dropped_notice += f'\n⚠️ 模型上下文不足，已自动丢弃更早的 {drop_count} 条消息后重试'
+                                non_sys = non_sys[drop_count:]
+                                current_messages = sys_msgs + non_sys
+                                continue  # 重试
+
+                            # 非上下文溢出错误，直接报错
+                            error_msg = f"[{resp.status}] {err_text}"
+                            yield f"data: {json.dumps({'error': error_msg})}\n\n"
+                            yield "data: [DONE]\n\n"
+                            return
+
+                        # 成功，发送累计的丢弃提示
+                        success = True
+                        if dropped_notice:
+                            yield f"data: {json.dumps({'notice': dropped_notice})}\n\n"
+
+                        # 流式读取响应
+                        async for raw_line in resp.content:
+                            line = raw_line.decode("utf-8").strip()
+                            if line.startswith("data: "):
+                                chunk = line[6:]
+                                if chunk == "[DONE]":
+                                    break
+                                try:
+                                    chunk_data = json.loads(chunk)
+                                    if chunk_data.get("usage"):
+                                        usage_capture["in"] = (chunk_data["usage"] or {}).get("prompt_tokens")
+                                        usage_capture["out"] = (chunk_data["usage"] or {}).get("completion_tokens")
+                                    choices = chunk_data.get("choices") or []
+                                    if not choices:
+                                        continue
+                                    delta = choices[0].get("delta", {})
+                                    content = delta.get("content", "")
+                                    reasoning = delta.get("reasoning_content", "")
+                                    if reasoning:
+                                        reasoning_text += reasoning
+                                        yield f"data: {json.dumps({'reasoning': reasoning})}\n\n"
+                                    if content:
+                                        collected += content
+                                        yield f"data: {json.dumps({'content': content})}\n\n"
+                                except json.JSONDecodeError:
+                                    continue
+                        break  # 成功完成，退出重试循环
+
         except Exception as e:
             error_msg = f"请求异常: {str(e)[:500]}"
             yield f"data: {json.dumps({'error': error_msg})}\n\n"
         finally:
             save_content = collected if collected else f"❌ {error_msg}" if error_msg else ""
-            # 优先用上游返回的真实 usage；未返回则用本地估算兜底
-            tokens_in = usage_capture.get("in") or prompt_est
-            tokens_out = usage_capture.get("out") or _estimate_tokens(collected)
-            msg_id = None
-            if save_content:
+            # 只在成功获得响应时才保存（重试全部失败时不保存空内容）
+            if success and save_content:
+                # 优先用上游返回的真实 usage；未返回则用本地估算兜底
+                tokens_in = usage_capture.get("in") or prompt_est
+                tokens_out = usage_capture.get("out") or _estimate_tokens(collected)
+                # 生成压缩版（仅 AI 回复，用户消息保持原样）
+                condensed = _condense_text(save_content) if len(save_content) > 200 else ""
                 db2 = await get_db()
                 try:
                     cur = await db2.execute(
-                        "INSERT INTO messages (chat_id, role, content, reasoning, tokens_in, tokens_out, created_at) VALUES (?,?,?,?,?,?,?)",
-                        (chat_id, "assistant", save_content,
+                        "INSERT INTO messages (chat_id, role, content, condensed, reasoning, tokens_in, tokens_out, created_at) VALUES (?,?,?,?,?,?,?,?)",
+                        (chat_id, "assistant", save_content, condensed,
                          reasoning_text if deep_thinking else "", tokens_in, tokens_out, int(time.time())))
                     msg_id = cur.lastrowid
                     await db2.execute("UPDATE chats SET updated_at=? WHERE id=?", (int(time.time()), chat_id))
+
+                    # 将 API 返回的真实 prompt_tokens 按比例分配到每条输入消息
+                    # 这样下次拼装时能用真实值替代估算
+                    real_prompt_tokens = usage_capture.get("in")
+                    if real_prompt_tokens and real_prompt_tokens > 0:
+                        input_msgs = [m for m in current_messages if m["role"] != "system"]
+                        total_chars = sum(len(m.get("content") or "") for m in input_msgs)
+                        if total_chars > 0:
+                            for m in input_msgs:
+                                content_len = len(m.get("content") or "")
+                                share = max(1, int(real_prompt_tokens * content_len / total_chars))
+                                # 更新 DB 中该消息的 tokens_in（仅更新 tokens_in 为 0 的消息，避免覆盖已有真实值）
+                                await db2.execute(
+                                    "UPDATE messages SET tokens_in=? WHERE chat_id=? AND role=? AND content=? AND (tokens_in=0 OR tokens_in IS NULL)",
+                                    (share, chat_id, m["role"], m.get("content") or ""))
+
                     await db2.commit()
                 finally:
                     await db2.close()
-            if msg_id:
-                yield f"data: {json.dumps({'saved_id': msg_id, 'tokens_in': tokens_in, 'tokens_out': tokens_out, 'window_pct': round(window_pct)})}\n\n"
+                if msg_id:
+                    yield f"data: {json.dumps({'saved_id': msg_id, 'tokens_in': tokens_in, 'tokens_out': tokens_out, 'window_pct': round(window_pct)})}\n\n"
+            elif not success and not error_msg:
+                yield f"data: {json.dumps({'error': '模型上下文不足，多次重试均失败，请缩短对话或更换模型'})}\n\n"
             yield "data: [DONE]\n\n"
 
     return StreamingResponse(stream_response(), media_type="text/event-stream")
