@@ -24,7 +24,7 @@
         <!-- 注册表单 -->
         <form id="signup-form" class="auth-form" style="display:none" onsubmit="handleSignup(event)">
             <input type="text" name="username" placeholder="用户名" required autocomplete="username" class="input" maxlength="30">
-            <input type="password" name="password" placeholder="密码" required autocomplete="new-password" class="input">
+            <input type="password" name="password" placeholder="密码（至少8位）" required minlength="8" autocomplete="new-password" class="input">
             <input type="text" name="qq" placeholder="QQ号（用于找回密码）" required class="input" maxlength="11" inputmode="numeric" autocomplete="off">
             <div class="captcha-row">
                 <span class="captcha-question" id="captcha-question">加载中...</span>
@@ -40,7 +40,7 @@
         <form id="forgot-form" class="auth-form" style="display:none" onsubmit="handleForgot(event)">
             <input type="text" name="username" placeholder="用户名" required autocomplete="username" class="input" maxlength="30">
             <input type="text" name="qq" placeholder="注册时绑定的QQ号" required class="input" maxlength="11" inputmode="numeric" autocomplete="off">
-            <input type="password" name="new_password" placeholder="新密码" required autocomplete="new-password" class="input">
+            <input type="password" name="new_password" placeholder="新密码（至少8位）" required minlength="8" autocomplete="new-password" class="input">
             <div class="captcha-row">
                 <span class="captcha-question" id="captcha-question-forgot">加载中...</span>
                 <input type="text" name="captcha_answer" placeholder="答案" required class="input captcha-input" maxlength="2" autocomplete="off" inputmode="numeric">

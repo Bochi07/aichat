@@ -34,6 +34,13 @@
                 <button class="btn btn-sm" onclick="saveKey(2)" style="background:var(--primary);color:#fff;white-space:nowrap">保存</button>
             </div>
             <div id="key-status-2" style="font-size:13px;color:#94a3b8;margin-top:4px"></div>
+
+            <div style="display:flex;gap:8px;margin-bottom:6px;border-top:1px solid #e2e8f0;margin-top:14px;padding-top:12px">
+                <select id="provider-pick-3" class="model-select" style="min-width:110px"></select>
+                <input type="text" id="key-input-3" class="input" style="flex:1;font-size:14px" placeholder="输入访问密钥..." autocomplete="off">
+                <button class="btn btn-sm" onclick="saveKey(3)" style="background:var(--primary);color:#fff;white-space:nowrap">保存</button>
+            </div>
+            <div id="key-status-3" style="font-size:13px;color:#94a3b8;margin-top:4px"></div>
         </div>
     </div>
 
@@ -44,7 +51,8 @@
         </div>
         <hr style="border:none;border-top:1px solid #e2e8f0;margin:8px 0">
         <form id="pwd-form" onsubmit="changePassword(event)" style="display:flex;flex-direction:column;gap:10px">
-            <input type="password" id="new-password" class="input" placeholder="新密码" required>
+            <input type="password" id="old-password" class="input" placeholder="当前密码" required autocomplete="current-password">
+            <input type="password" id="new-password" class="input" placeholder="新密码（至少8位）" required minlength="8" autocomplete="new-password">
             <button type="submit" class="btn btn-primary">修改密码</button>
         </form>
         <div id="pwd-msg"></div>
@@ -74,16 +82,18 @@
 
 <script>
 const PROVIDER_IDS=['deepseek','qwen','ernie','mimo'];
+const KEY_SLOTS=[1,2,3];   // 设置页可同时展示的密钥槽位数
 let PROVIDER_INFO={},keysData={};
 
 function hasKey(pid){return !!(keysData[pid]&&keysData[pid].has_key);}
+function slotValue(n){const s=document.getElementById('provider-pick-'+n);return s?s.value:'';}
 
-function initModule(n,excludePid){
+function initModule(n,excludePids){
     const sel=document.getElementById('provider-pick-'+n);
-    const others=p=>p!==excludePid;
-    let chosen=PROVIDER_IDS.find(p=>others(p)&&hasKey(p));   // 优先选已配置的厂商
-    if(!chosen)chosen=PROVIDER_IDS.find(p=>others(p));        // 否则选任意其他厂商
-    if(!chosen)chosen=PROVIDER_IDS[0];
+    const ok=p=>excludePids.indexOf(p)<0;
+    let chosen=PROVIDER_IDS.find(p=>ok(p)&&hasKey(p));   // 优先选已配置、且未被其他槽位占用的厂商
+    if(!chosen)chosen=PROVIDER_IDS.find(ok);             // 否则选任意未被占用的厂商
+    if(!chosen)chosen=PROVIDER_IDS[0];                   // 厂商数少于槽位数时兜底
     sel.innerHTML=PROVIDER_IDS.map(p=>`<option value="${p}" ${p===chosen?'selected':''}>${(PROVIDER_INFO[p]||{}).name||p}</option>`).join('');
     sel.onchange=()=>updateModuleStatus(n);
     updateModuleStatus(n);
@@ -94,20 +104,26 @@ function updateModuleStatus(n){
     const pid=sel?sel.value:PROVIDER_IDS[0];
     const name=(PROVIDER_INFO[pid]||{}).name||pid;
     const st=document.getElementById('key-status-'+n);
+    const inp=document.getElementById('key-input-'+n);
+    // 已保存的 key 完整回显到输入框，方便核对与复制；切换到别的厂商则显示该厂商的 key（未配置则清空）
+    if(inp)inp.value=hasKey(pid)?(keysData[pid].api_key||''):'';
     st.innerHTML=hasKey(pid)?name+'：✅ 已配置 <button class="btn btn-sm" onclick="deleteKeyFrom('+n+')" style="background:#ef4444;color:#fff;margin-left:6px">删除</button>':name+'：未配置';
 }
 
 function updateGlobalStatus(){
     const parts=PROVIDER_IDS.map(pid=>hasKey(pid)?(PROVIDER_INFO[pid]||{}).name||pid:'').filter(Boolean);
-    document.getElementById('key-status').textContent=parts.length?'已配置：'+parts.join(' | '):'暂未配置访问密钥';
+    let text=parts.length?'已配置：'+parts.join(' | '):'暂未配置访问密钥';
+    // 厂商比槽位多时，多出来的 key 不在任何槽位里，提示可切换下拉框查看
+    if(parts.length>KEY_SLOTS.length)text+='（厂商多于槽位，切换下方下拉框即可查看/修改其余 key）';
+    document.getElementById('key-status').textContent=text;
 }
 
 async function loadInfo(){
     const[provResp,keysResp,meResp]=await Promise.all([fetch('api/providers'),fetch('api/keys'),fetch('api/auth/me')]);
     PROVIDER_INFO=await provResp.json();keysData=await keysResp.json();
     updateGlobalStatus();
-    initModule(1,null);
-    initModule(2,document.getElementById('provider-pick-1').value);
+    const used=[];
+    KEY_SLOTS.forEach(n=>{initModule(n,used.slice());const p=slotValue(n);if(p)used.push(p);});
     document.getElementById('account-name').textContent=meResp.ok?(await meResp.json()).username:'已登录';
 }
 
@@ -127,7 +143,7 @@ async function deleteKeyFrom(n){
     if(resp.ok)location.reload();else alert((await resp.json()).detail||'失败');
 }
 
-async function changePassword(e){e.preventDefault();const pwd=document.getElementById('new-password').value.trim();if(!pwd)return;const msg=document.getElementById('pwd-msg'),resp=await fetch('api/auth/password',{method:'PUT',headers:{'Content-Type':'application/json'},body:JSON.stringify({password:pwd})}),data=await resp.json();msg.style.display='block';msg.style.fontSize='13px';msg.style.marginTop='6px';msg.style.color=resp.ok?'#16a34a':'#dc2626';msg.textContent=data.message||data.detail||'失败';if(resp.ok){document.getElementById('new-password').value='';setTimeout(()=>{window.location.href='login';},1200);}}
+async function changePassword(e){e.preventDefault();const oldEl=document.getElementById('old-password'),newEl=document.getElementById('new-password'),oldPwd=oldEl.value,newPwd=newEl.value.trim();if(!oldPwd||!newPwd)return;const msg=document.getElementById('pwd-msg'),resp=await fetch('api/auth/password',{method:'PUT',headers:{'Content-Type':'application/json'},body:JSON.stringify({old_password:oldPwd,new_password:newPwd})}),data=await resp.json();msg.style.display='block';msg.style.fontSize='13px';msg.style.marginTop='6px';msg.style.color=resp.ok?'#16a34a':'#dc2626';msg.textContent=data.message||data.detail||'失败';oldEl.value='';if(resp.ok){newEl.value='';setTimeout(()=>{window.location.href='login';},1200);}}
 
 document.getElementById('del-confirm').addEventListener('input',function(){document.getElementById('btn-del').disabled=this.value.trim()!=='确认注销此账号';});
 async function deleteAccount(e){e.preventDefault();const c=document.getElementById('del-confirm').value.trim();if(c!=='确认注销此账号')return;if(!confirm('不可撤销！'))return;const msg=document.getElementById('del-msg'),resp=await fetch('api/auth/account',{method:'DELETE',headers:{'Content-Type':'application/json'},body:JSON.stringify({confirm:c})}),data=await resp.json();msg.style.display='block';msg.style.fontSize='13px';msg.style.marginTop='6px';if(resp.ok){msg.style.color='#16a34a';msg.textContent='已注销，即将跳转...';setTimeout(()=>{window.location.href='login';},1500);}else{msg.style.color='#dc2626';msg.textContent=data.detail||'失败';}}
