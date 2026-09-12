@@ -36,7 +36,7 @@
 
 | 提供商 | 模型示例 |
 |--------|----------|
-| **DeepSeek** | deepseek-v4-pro, deepseek-v4-flash |
+| **DeepSeek** | deepseek-v4-pro, deepseek-v4-flash，deepseek-v4.1-flash |
 | **通义千问 (Qwen)** | qwen3.7-max, qwen-max, qwen-plus, qwen-flash |
 | **文心 (Ernie)** | ernie-5.1, ernie-4.5-turbo, ernie-4.0-turbo, ernie-speed |
 | **小米 MiLM** | mimo-v2.5-pro, mimo-v2.5 |
