@@ -163,7 +163,7 @@ window.renderMarkdown=function(text){
 </div>
 
 <script>
-let currentChatId=null,abortController=null,currentMessageIds={},searchTimer=null;
+let currentChatId=null,abortController=null,currentMessageIds={},searchTimer=null,currentStreamingId=null,pollTimer=null,resuming=false;
 let sidebarOpen=!window.matchMedia('(max-width:1023px)').matches;
 const PROVIDER_LIST=['deepseek','qwen','ernie','mimo'];
 let PROVIDERS={},providerModels={};
@@ -175,11 +175,8 @@ async function loadProviders(){
     sel.innerHTML=PROVIDER_LIST.map(p=>`<option value="${p}">${(PROVIDERS[p]||{}).name||p}</option>`).join('');
     const saved=localStorage.getItem('provider')||'deepseek';
     sel.value=saved in PROVIDERS?saved:'deepseek';
-    onProviderChange(false);
-    const m=localStorage.getItem('model');
-    if(m&&providerModels[saved]&&providerModels[saved].includes(m))document.getElementById('model-select').value=m;
     document.getElementById('deep-think').checked=localStorage.getItem('deepThink')==='true';
-    document.getElementById('think-label').style.display=(sel.value==='deepseek'||sel.value==='mimo'||sel.value==='qwen')?'':'none';
+    onProviderChange(false);
 }
 function onProviderChange(save=true){
     const pid=document.getElementById('provider-select').value;
@@ -187,11 +184,22 @@ function onProviderChange(save=true){
     const def=PROVIDERS[pid]?PROVIDERS[pid].default_model:providerModels[0]||'';
     const sel=document.getElementById('model-select');
     sel.innerHTML=providerModels.map(m=>`<option value="${m}">${m}</option>`).join('');
-    sel.value=localStorage.getItem('model')&&providerModels.includes(localStorage.getItem('model'))?localStorage.getItem('model'):def;
+    // 按厂商分别记住上次选的模型。
+    // 旧版只有一个全局 model 键，切到别的厂商就会被覆盖，
+    // 切回来只剩默认模型 —— 用户会以为“我选的模型没生效”。
+    let savedModel=localStorage.getItem('model:'+pid);
+    if(!savedModel&&localStorage.getItem('provider')===pid)savedModel=localStorage.getItem('model');
+    sel.value=(savedModel&&providerModels.includes(savedModel))?savedModel:def;
     document.getElementById('think-label').style.display=(pid==='deepseek'||pid==='mimo'||pid==='qwen')?'':'none';
     if(save)savePrefs();
 }
-function savePrefs(){localStorage.setItem('provider',document.getElementById('provider-select').value);localStorage.setItem('model',document.getElementById('model-select').value);localStorage.setItem('deepThink',document.getElementById('deep-think').checked);}
+function savePrefs(){
+    const pid=document.getElementById('provider-select').value;
+    localStorage.setItem('provider',pid);
+    localStorage.setItem('model:'+pid,document.getElementById('model-select').value);
+    localStorage.setItem('model',document.getElementById('model-select').value);
+    localStorage.setItem('deepThink',document.getElementById('deep-think').checked);
+}
 loadProviders();loadChats();applySidebarState();
 // 输入框自动扩展 + Enter发送/Shift+Enter换行
 (function(){var t=document.getElementById('msg-input');t.addEventListener('input',function(){this.style.height='auto';this.style.height=Math.min(this.scrollHeight,150)+'px';});t.addEventListener('keydown',function(e){if(e.key==='Enter'&&!e.shiftKey){e.preventDefault();document.getElementById('msg-form').requestSubmit();}});})();
@@ -251,11 +259,13 @@ function renderMessage(m){
     const domId='msg-'+m.id;currentMessageIds[domId]=m.id;
     const hasR=m.role==='assistant'&&m.reasoning&&m.reasoning.trim();
     const isUser=m.role==='user';
+    // 服务端仍在生成（切屏/断线后回来时可能遇到）
+    const isStreaming=m.role==='assistant'&&(m.status==='streaming'||m.status==='cancelled');
     // 用户消息：纯文本；AI 消息：渲染 Markdown
     const rendered=isUser?escHtml(m.content).replace(/\n/g,'<br>'):renderMarkdown(m.content);
     const tIn=m.tokens_in||0,tOut=m.tokens_out||0;
     const tokenHtml=(!isUser&&(tIn||tOut))?`<div class="msg-tokens">⬆ ${fmtTok(tIn)} · ⬇ ${fmtTok(tOut)} · 共 ${fmtTok(tIn+tOut)}</div>`:'';
-    return`<div class="message ${m.role}" id="${domId}"><div class="msg-header"><span class="msg-role">${isUser?'我':'助手'}</span><button class="msg-del" onclick="deleteMessage(${m.id},'${domId}')">✕</button></div>${hasR?`<div class="msg-reasoning collapsed"><div class="reasoning-bar" onclick="this.parentElement.classList.toggle('collapsed')"><span>分析过程</span><span class="reasoning-arrow">▾</span></div><div class="reasoning-body">${escHtml(m.reasoning)}</div></div>`:''}<div class="msg-content">${rendered}</div>${tokenHtml}<button class="msg-copy" onclick="copyMsg(event)" title="复制"><svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg></button></div>`;
+    return`<div class="message ${m.role}" id="${domId}"><div class="msg-header"><span class="msg-role">${isUser?'我':'助手'}</span>${isStreaming?'<span style="font-size:11px;color:#94a3b8;margin-left:6px">生成中…</span>':''}<button class="msg-del" onclick="deleteMessage(${m.id},'${domId}')">✕</button></div>${hasR?`<div class="msg-reasoning collapsed"><div class="reasoning-bar" onclick="this.parentElement.classList.toggle('collapsed')"><span>分析过程</span><span class="reasoning-arrow">▾</span></div><div class="reasoning-body">${escHtml(m.reasoning)}</div></div>`:''}<div class="msg-content">${rendered}</div>${tokenHtml}<button class="msg-copy" onclick="copyMsg(event)" title="复制"><svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg></button></div>`;
 }
 
 
@@ -294,6 +304,7 @@ async function sendMessage(e){
     const aiDomId=appendMessage('assistant','',deepThink?'正在深度思考…':'正在快速回复…');
     abortController=new AbortController();
     let savedId=null;
+    currentStreamingId=null;stopPoll();
     try{
         const resp=await fetch('api/chats/'+currentChatId+'/send',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({message,provider,model,deep_thinking:deepThink}),signal:abortController.signal});
         if(!resp.ok){
@@ -314,6 +325,7 @@ async function sendMessage(e){
                 if(chunk==='[DONE]')return true;
                 try{
                     const d=JSON.parse(chunk);
+                    if(d.streaming_id!==undefined)currentStreamingId=d.streaming_id;
                     if(d.error)updateMessage(aiDomId,'❌ '+d.error);
                     else if(d.notice)showNotice(d.notice,aiDomId);
                     else if(d.reasoning&&deepThink){hasReasoning=true;appendReasoning(aiDomId,d.reasoning);}
@@ -334,11 +346,15 @@ async function sendMessage(e){
         if(savedId){const el=document.getElementById(aiDomId);if(el){el.id='msg-'+savedId;currentMessageIds[el.id]=savedId;const h=el.querySelector('.msg-header');if(h&&!h.querySelector('.msg-del')){const b=document.createElement('button');b.className='msg-del';b.textContent='✕';b.setAttribute('onclick','deleteMessage('+savedId+',\''+el.id+'\')');h.appendChild(b);}}}
         if(!savedId)await refreshMessages();
     }catch(err){if(err.name!=='AbortError')updateMessage(aiDomId,'❌ '+err.message);await refreshMessages();}
-    abortController=null;setSendState(false);loadChats();
+    abortController=null;if(!resuming)setSendState(false);loadChats();
 }
 
 function setSendState(s){document.getElementById('btn-send').style.display=s?'none':'inline-block';document.getElementById('btn-stop').style.display=s?'inline-block':'none';}
-function stopStream(){if(abortController)abortController.abort();}
+function stopStream(){
+    // 生成已与服务端连接解耦：必须显式通知服务端中止，否则它会继续跑完
+    if(currentStreamingId)fetch('api/messages/'+currentStreamingId+'/cancel',{method:'POST'}).catch(function(){});
+    if(abortController)abortController.abort();
+}
 function scrollToBottom(smooth){const el=document.getElementById('messages');smooth?el.scrollTop=el.scrollHeight:el.scrollTo({top:el.scrollHeight,behavior:'instant'});}
 function showNotice(text,aiDomId){
     const el=document.getElementById('messages'),ai=el&&document.getElementById(aiDomId||'');if(!el)return;
@@ -370,7 +386,43 @@ function finalizeMarkdown(domId){const el=document.getElementById(domId);if(!el)
 function getMsgRawText(el){const c=el.querySelector('.msg-content');return c.dataset.raw!==undefined?c.dataset.raw:c.textContent||'';}
 function copyMsg(e){e.stopPropagation();e.preventDefault();var btn=e.currentTarget,msg=btn.closest('.message'),text=getMsgRawText(msg),done=function(){btn.innerHTML='<svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="#16a34a" stroke-width="3"><polyline points="20 6 9 17 4 12"/></svg>';setTimeout(function(){btn.innerHTML='<svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg>';},1500);};if(navigator.clipboard&&navigator.clipboard.writeText){navigator.clipboard.writeText(text).then(done).catch(function(){});}else{var ta=document.createElement('textarea');ta.value=text;ta.style.position='fixed';ta.style.left='-9999px';document.body.appendChild(ta);ta.select();try{document.execCommand('copy');done();}catch(_){}document.body.removeChild(ta);}}
 
-async function refreshMessages(){if(!currentChatId)return;const resp=await fetch('api/chats/'+currentChatId+'/messages'),msgs=await resp.json();currentMessageIds={};const el=document.getElementById('messages');el.innerHTML=msgs.length?msgs.map(m=>renderMessage(m)).join(''):'<div class="empty-state"><p>开始实验吧</p></div>';}
+function renderMsgs(msgs){currentMessageIds={};const el=document.getElementById('messages');el.innerHTML=msgs.length?msgs.map(m=>renderMessage(m)).join(''):'<div class="empty-state"><p>开始实验吧</p></div>';}
+async function refreshMessages(){if(!currentChatId)return;const resp=await fetch('api/chats/'+currentChatId+'/messages'),msgs=await resp.json();renderMsgs(msgs);}
+
+function stopPoll(){if(pollTimer){clearInterval(pollTimer);pollTimer=null;}}
+function startPoll(){
+    if(pollTimer)return;
+    setSendState(true);
+    pollTimer=setInterval(async()=>{
+        if(!currentChatId){stopPoll();return;}
+        try{
+            const resp=await fetch('api/chats/'+currentChatId+'/messages');
+            if(!resp.ok)return;
+            const msgs=await resp.json();
+            renderMsgs(msgs);
+            if(!msgs.some(m=>m.role==='assistant'&&(m.status==='streaming'||m.status==='cancelled'))){
+                stopPoll();currentStreamingId=null;setSendState(false);loadChats();
+            }
+        }catch(_){}
+    },1200);
+}
+// 切屏回来：生成在服务端照常进行，这里断开旧的转发通道，改为按数据库补拉并轮询到结束
+document.addEventListener('visibilitychange',async function(){
+    if(document.visibilityState!=='visible'||!currentChatId)return;
+    if(!currentStreamingId&&!abortController)return;
+    resuming=true;
+    if(abortController){abortController.abort();abortController=null;}
+    try{
+        const resp=await fetch('api/chats/'+currentChatId+'/messages');
+        if(resp.ok){
+            const msgs=await resp.json();
+            renderMsgs(msgs);
+            if(msgs.some(m=>m.role==='assistant'&&(m.status==='streaming'||m.status==='cancelled')))startPoll();
+            else{currentStreamingId=null;setSendState(false);}
+        }
+    }catch(_){}
+    resuming=false;
+});
 
 function startRename(id){
 	const span=document.getElementById('ctitle-'+id);
