@@ -261,11 +261,13 @@ function renderMessage(m){
     const isUser=m.role==='user';
     // 服务端仍在生成（切屏/断线后回来时可能遇到）
     const isStreaming=m.role==='assistant'&&(m.status==='streaming'||m.status==='cancelled');
+    // 报错消息：留在对话里，红字纯文本（不渲染 Markdown，也不显示 token）
+    const isError=m.role==='assistant'&&m.status==='error';
     // 用户消息：纯文本；AI 消息：渲染 Markdown
-    const rendered=isUser?escHtml(m.content).replace(/\n/g,'<br>'):renderMarkdown(m.content);
-    const tIn=m.tokens_in||0,tOut=m.tokens_out||0;
+    const rendered=isUser?escHtml(m.content).replace(/\n/g,'<br>'):(isError?('❌ '+escHtml(m.content)).replace(/\n/g,'<br>'):renderMarkdown(m.content));
+    const tIn=isError?0:(m.tokens_in||0),tOut=isError?0:(m.tokens_out||0);
     const tokenHtml=(!isUser&&(tIn||tOut))?`<div class="msg-tokens">⬆ ${fmtTok(tIn)} · ⬇ ${fmtTok(tOut)} · 共 ${fmtTok(tIn+tOut)}</div>`:'';
-    return`<div class="message ${m.role}" id="${domId}"><div class="msg-header"><span class="msg-role">${isUser?'我':'助手'}</span>${isStreaming?'<span style="font-size:11px;color:#94a3b8;margin-left:6px">生成中…</span>':''}<button class="msg-del" onclick="deleteMessage(${m.id},'${domId}')">✕</button></div>${hasR?`<div class="msg-reasoning collapsed"><div class="reasoning-bar" onclick="this.parentElement.classList.toggle('collapsed')"><span>分析过程</span><span class="reasoning-arrow">▾</span></div><div class="reasoning-body">${escHtml(m.reasoning)}</div></div>`:''}<div class="msg-content">${rendered}</div>${tokenHtml}<button class="msg-copy" onclick="copyMsg(event)" title="复制"><svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg></button></div>`;
+    return`<div class="message ${m.role}" id="${domId}"><div class="msg-header"><span class="msg-role">${isUser?'我':'助手'}</span>${isStreaming?'<span style="font-size:11px;color:#94a3b8;margin-left:6px">生成中…</span>':''}<button class="msg-del" onclick="deleteMessage(${m.id},'${domId}')">✕</button></div>${hasR?`<div class="msg-reasoning collapsed"><div class="reasoning-bar" onclick="this.parentElement.classList.toggle('collapsed')"><span>分析过程</span><span class="reasoning-arrow">▾</span></div><div class="reasoning-body">${escHtml(m.reasoning)}</div></div>`:''}<div class="msg-content"${isError?' style="color:#dc2626"':''}>${rendered}</div>${tokenHtml}<button class="msg-copy" onclick="copyMsg(event)" title="复制"><svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg></button></div>`;
 }
 
 
