@@ -5,6 +5,7 @@ FastAPI + SQLite，明文密码，手机端优化
 import asyncio
 import hashlib
 import hmac
+import ipaddress
 import json
 import os
 import random
@@ -251,15 +252,45 @@ os.makedirs(DATA_DIR, exist_ok=True)
 DB_PATH = os.path.join(DATA_DIR, "data.db")
 JWT_EXPIRE_SECONDS = 7 * 24 * 3600
 MAX_SESSIONS = 5
+# 可信反向代理地址。只有直连方本身在这个集合里，才采信它带来的 X-Forwarded-For。
+# 默认只信任本机，所以：若你的 nginx 与应用不在同一台机器，必须把 nginx 的 IP
+# 通过环境变量 TRUSTED_PROXIES 加进来，否则所有访客会被当成同一个来源。
+TRUSTED_PROXIES = {p.strip() for p in os.getenv("TRUSTED_PROXIES", "127.0.0.1,::1").split(",") if p.strip()}
+# 连续失败多少次后锁定 / 锁定时长（秒）
+LOCKOUT_THRESHOLD = 5
+LOCKOUT_SECONDS = 900
+# 新设密码的最小长度。只约束"设置新密码"，老用户已有的短密码照样能登录。
+PASSWORD_MIN_LEN = 8
+# 用户不存在时拿来陪跑的假凭据：让"用户不存在"和"密码错误"走完全相同的比较路径，
+# 避免用响应时间差探测某个用户名是否注册过。
+_DUMMY_SECRET = "0" * 64
 OUTPUT_RESERVE_TOKENS_BASE = 1024   # 输出预留基础值（动态调整）
 CONTEXT_FALLBACK_TOKENS = 1_000_000   # 未列出的模型默认窗口（统一 1M）
 CONTEXT_SAFETY_BUFFER = 200          # 安全余量（降低以最大化利用上下文）
+
+# 项目自带的公开占位密钥（见 Dockerfile / docker-compose.yml）。
+# 用它们启动等于把签名密钥公之于众，因此与"未设置"同等对待，一律拒绝启动。
+_INSECURE_SECRET_KEYS = {
+    "change-me-to-random-string",
+    "请改成随机字符串至少32位",
+    "changeme", "change-me", "your-secret-key", "secret",
+}
 
 if not SECRET_KEY:
     raise RuntimeError(
         "\n!!! 未设置 SECRET_KEY，拒绝启动 !!!\n"
         "请执行: echo \"SECRET_KEY=$(python3 -c 'import secrets;print(secrets.token_hex(32))')\" >> .env\n"
     )
+
+if SECRET_KEY.lower() in _INSECURE_SECRET_KEYS:
+    raise RuntimeError(
+        "\n!!! SECRET_KEY 仍是公开的占位符，拒绝启动 !!!\n"
+        "请执行: echo \"SECRET_KEY=$(python3 -c 'import secrets;print(secrets.token_hex(32))')\" >> .env\n"
+        "（Docker 部署请修改 docker-compose.yml 中的 SECRET_KEY）\n"
+    )
+
+if len(SECRET_KEY) < 32:
+    print("[WARN] SECRET_KEY 长度不足 32 位，建议改用 secrets.token_hex(32) 生成的随机串。")
 
 app = FastAPI(title="个人学习实验台", docs_url=None, redoc_url=None)
 
@@ -288,11 +319,37 @@ def _cleanup_blacklist():
 # ============================================================
 _RATE_LIMITS = defaultdict(deque)   # key -> 最近请求时间戳队列
 
+def _valid_ip(value: str) -> str:
+    """规整成合法 IP；非法值（含伪造的超长字符串）返回空串。"""
+    try:
+        return str(ipaddress.ip_address((value or "").strip()))
+    except ValueError:
+        return ""
+
+_TRUST_PROXY_WARNED = False
+
 def _client_ip(request: Request) -> str:
-    fwd = request.headers.get("x-forwarded-for")
-    if fwd:
-        return fwd.split(",")[0].strip()
-    return request.client.host if request.client else "unknown"
+    """返回真实客户端 IP。
+
+    X-Forwarded-For 是客户端可以随意伪造的请求头，因此只有"直连方本身
+    是可信代理"时才采信它；并且从右往左取第一个非可信地址 —— 反向代理是
+    把真实来源追加在最右侧的，客户端自己塞进去的值只会留在左边。
+    """
+    global _TRUST_PROXY_WARNED
+    peer = _valid_ip(request.client.host if request.client else "") or "unknown"
+    if peer not in TRUSTED_PROXIES:
+        # 直连方不可信：完全忽略 X-Forwarded-For
+        if not _TRUST_PROXY_WARNED and request.headers.get("x-forwarded-for"):
+            _TRUST_PROXY_WARNED = True
+            print(f"[WARN] 直连方 {peer} 不在 TRUSTED_PROXIES 中，已忽略其 X-Forwarded-For。"
+                  f"若本服务部署在反向代理之后，请把代理地址加入环境变量 TRUSTED_PROXIES，"
+                  f"否则所有访客会被当成同一来源、共用同一份限流额度。")
+        return peer
+    for part in reversed(request.headers.get("x-forwarded-for", "").split(",")):
+        ip = _valid_ip(part)
+        if ip and ip not in TRUSTED_PROXIES:
+            return ip
+    return peer
 
 def _rate_limit(key: str, limit: int, window: int):
     """滑动窗口：window 秒内最多 limit 次，超出抛 429"""
@@ -345,6 +402,17 @@ async def init_db():
             jti TEXT UNIQUE NOT NULL,
             created_at INTEGER NOT NULL,
             FOREIGN KEY (user_id) REFERENCES users(id)
+        );
+        -- 登录/找回密码的失败计数。刻意存在数据库而不是内存里：
+        -- 内存计数在多 worker（gunicorn workers=4 / uwsgi processes=4）下各算各的，
+        -- 重启还会清零，等于没有锁定。
+        CREATE TABLE IF NOT EXISTS auth_fails (
+            scope TEXT NOT NULL,
+            key TEXT NOT NULL,
+            fail_count INTEGER NOT NULL DEFAULT 0,
+            locked_until INTEGER NOT NULL DEFAULT 0,
+            updated_at INTEGER NOT NULL,
+            PRIMARY KEY (scope, key)
         );
         CREATE TABLE IF NOT EXISTS api_keys (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -529,6 +597,158 @@ async def _remove_session(jti: str):
     finally:
         await db.close()
 
+# ============================================================
+# 密码哈希
+# ------------------------------------------------------------
+# 存储格式（参数写进字符串里，将来调整强度不会让老哈希失效）：
+#   scrypt$n$r$p$<salt_hex>$<hash_hex>
+#   pbkdf2$<iterations>$<salt_hex>$<hash_hex>
+# 密码一律先按 UTF-8 编码再参与运算，所以中文、日文、emoji、任意符号
+# 都能正常作为密码使用（这也正是不能把 str 直接丢给 hmac.compare_digest 的原因：
+# 它只接受纯 ASCII）。
+#
+# 历史遗留的明文密码继续可用：_looks_hashed() 严格识别本站哈希格式，
+# 识别不出来的值一律按明文处理，并在该用户下次登录成功时静默升级为哈希。
+# ============================================================
+_SCRYPT_N, _SCRYPT_R, _SCRYPT_P = 2 ** 15, 8, 1     # 约 32MB 内存
+# scrypt 需要 128*N*r 字节内存，OpenSSL 默认上限恰好是 32MB，会把 N=2^15 挡下来
+# （报 "memory limit exceeded"）。这里显式放行并留一倍余量。
+_SCRYPT_MAXMEM = 128 * _SCRYPT_N * _SCRYPT_R * 2
+_PBKDF2_ITERATIONS = 600_000
+_SALT_BYTES = 16
+_HASH_DKLEN = 32
+
+def _scrypt_supported() -> bool:
+    """探测 scrypt 是否可用。
+
+    必须用与正式哈希**完全相同**的参数探测，否则会出现"探测通过、
+    正式调用却失败"——注册/改密当场 500。
+    """
+    try:
+        hashlib.scrypt(b"probe", salt=b"probe", n=_SCRYPT_N, r=_SCRYPT_R, p=_SCRYPT_P,
+                       dklen=_HASH_DKLEN, maxmem=_SCRYPT_MAXMEM)
+        return True
+    except Exception:
+        return False
+
+_HAS_SCRYPT = _scrypt_supported()
+
+def _secret_equal(stored: str, submitted: str) -> bool:
+    """恒定时间比较（用于未哈希的值，如绑定的 QQ 号）。
+
+    统一编码成 bytes 再比：hmac.compare_digest 对 str 只接受纯 ASCII，
+    而本项目允许中文，直接传 str 会抛 TypeError。
+    """
+    return hmac.compare_digest((stored or "").encode("utf-8"), (submitted or "").encode("utf-8"))
+
+def _hash_password(password: str) -> str:
+    """生成带随机盐的密码哈希。"""
+    salt = os.urandom(_SALT_BYTES)
+    raw = password.encode("utf-8")
+    if _HAS_SCRYPT:
+        try:
+            dk = hashlib.scrypt(raw, salt=salt, n=_SCRYPT_N, r=_SCRYPT_R, p=_SCRYPT_P,
+                                dklen=_HASH_DKLEN, maxmem=_SCRYPT_MAXMEM)
+            return f"scrypt${_SCRYPT_N}${_SCRYPT_R}${_SCRYPT_P}${salt.hex()}${dk.hex()}"
+        except Exception:
+            # 运行环境临时不给用就退回 pbkdf2，绝不让注册/改密因此失败
+            pass
+    dk = hashlib.pbkdf2_hmac("sha256", raw, salt, _PBKDF2_ITERATIONS, dklen=_HASH_DKLEN)
+    return f"pbkdf2${_PBKDF2_ITERATIONS}${salt.hex()}${dk.hex()}"
+
+def _looks_hashed(stored: str) -> bool:
+    """严格判断是否为本站生成的哈希串。
+
+    要求字段数和十六进制内容都完全对得上，因此"碰巧长这样的密码"
+    不会（实际上也不可能）被误判成哈希。
+    """
+    if not stored:
+        return False
+    parts = stored.split("$")
+    try:
+        if parts[0] == "scrypt" and len(parts) == 6:
+            int(parts[1]), int(parts[2]), int(parts[3])
+            bytes.fromhex(parts[4]), bytes.fromhex(parts[5])
+            return True
+        if parts[0] == "pbkdf2" and len(parts) == 4:
+            int(parts[1])
+            bytes.fromhex(parts[2]), bytes.fromhex(parts[3])
+            return True
+    except (ValueError, TypeError):
+        return False
+    return False
+
+def _verify_password(stored: str, submitted: str) -> tuple[bool, bool]:
+    """校验密码，返回 (是否正确, 是否需要升级为哈希)。
+
+    老用户的明文密码在这条路径里同样是恒定时间比较，且一旦登录成功
+    就会被调用方改写成哈希，用户完全无感。
+    """
+    if not _looks_hashed(stored):
+        return _secret_equal(stored, submitted), True
+    try:
+        parts = stored.split("$")
+        if parts[0] == "scrypt":
+            _, n, r, p, salt_hex, hash_hex = parts
+            # 校验时必须同样放行内存：参数取自存储串，将来调整强度也不会让老哈希失效
+            dk = hashlib.scrypt(submitted.encode("utf-8"), salt=bytes.fromhex(salt_hex),
+                                n=int(n), r=int(r), p=int(p), dklen=len(hash_hex) // 2,
+                                maxmem=max(_SCRYPT_MAXMEM, 128 * int(n) * int(r) * 2))
+        else:
+            _, iterations, salt_hex, hash_hex = parts
+            dk = hashlib.pbkdf2_hmac("sha256", submitted.encode("utf-8"),
+                                     bytes.fromhex(salt_hex), int(iterations),
+                                     dklen=len(hash_hex) // 2)
+        return hmac.compare_digest(dk.hex(), hash_hex), False
+    except Exception:
+        return False, False
+
+# 用户不存在时，拿它跑一次完整的哈希校验，让"用户不存在"与"密码错误"耗时一致
+_DUMMY_HASH = _hash_password(_DUMMY_SECRET)
+
+# ============================================================
+# 认证失败锁定（防爆破）
+# ============================================================
+async def _lock_remaining(db, scope: str, key: str) -> int:
+    """返回剩余锁定秒数，0 表示未锁定。"""
+    row = await fetch_one(db, "SELECT locked_until FROM auth_fails WHERE scope=? AND key=?",
+                          (scope, key))
+    if not row:
+        return 0
+    remain = int(row["locked_until"]) - int(time.time())
+    return remain if remain > 0 else 0
+
+_FAIL_PURGE_COUNTER = 0
+
+async def _record_failure(db, scope: str, key: str):
+    """记一次失败；连续失败达到阈值即锁定。
+
+    key 用"提交上来的用户名"，不论该用户是否真实存在都记同样的账，
+    因此锁不锁定这件事本身不会泄露用户名是否已注册。
+    """
+    global _FAIL_PURGE_COUNTER
+    now = int(time.time())
+    row = await fetch_one(db,
+        "SELECT fail_count, updated_at FROM auth_fails WHERE scope=? AND key=?", (scope, key))
+    # 距上次失败已超过锁定时长，视为新一轮
+    count = row["fail_count"] + 1 if row and now - row["updated_at"] <= LOCKOUT_SECONDS else 1
+    locked_until = now + LOCKOUT_SECONDS if count >= LOCKOUT_THRESHOLD else 0
+    await db.execute(
+        "INSERT OR REPLACE INTO auth_fails (scope, key, fail_count, locked_until, updated_at)"
+        " VALUES (?,?,?,?,?)", (scope, key, count, locked_until, now))
+    # 攻击者可以用随机用户名刷失败记录，让这张表无限膨胀，
+    # 所以每隔若干次写入顺手清掉"锁定已过期且久未活动"的行。
+    _FAIL_PURGE_COUNTER += 1
+    if _FAIL_PURGE_COUNTER >= 200:
+        _FAIL_PURGE_COUNTER = 0
+        await db.execute("DELETE FROM auth_fails WHERE locked_until <= ? AND updated_at <= ?",
+                         (now, now - LOCKOUT_SECONDS * 4))
+    await db.commit()
+
+async def _clear_failures(db, scope: str, key: str):
+    await db.execute("DELETE FROM auth_fails WHERE scope=? AND key=?", (scope, key))
+    await db.commit()
+
 def _current_jti(request: Request) -> str:
     token = request.cookies.get("token")
     if token:
@@ -557,23 +777,35 @@ async def _activate_single_session(user_id: int, current_jti: str):
 # ============================================================
 # 验证码
 # ============================================================
+_USED_CAPTCHAS: dict = {}   # signed -> 消耗时间戳（带过期清理，防内存无限增长）
+_CAPTCHA_TTL = 300          # 验证码有效期（秒）
+
+def _captcha_mac(exp: str, nonce: str, answer: str) -> str:
+    """对 (过期时间, 随机数, 答案) 整体签名。答案本身永不出现在返回给浏览器的内容里。"""
+    msg = f"{exp}|{nonce}|{answer}".encode()
+    return hmac.new(SECRET_KEY.encode(), msg, hashlib.sha256).hexdigest()[:16]
+
 def _gen_captcha() -> tuple[str, str]:
     a, b = random.randint(1, 9), random.randint(1, 9)
     question = f"{a} + {b} = ?"
     answer = str(a + b)
-    sig = hmac.new(SECRET_KEY.encode(), answer.encode(), hashlib.sha256).hexdigest()[:16]
-    return question, f"{sig}:{answer}"
+    exp = str(int(time.time()) + _CAPTCHA_TTL)
+    nonce = uuid.uuid4().hex
+    # 令牌只含 过期时间 / 随机数 / 签名 —— 正确答案留在服务端。
+    return question, f"{exp}:{nonce}:{_captcha_mac(exp, nonce, answer)}"
 
-def _verify_captcha(signed: str) -> bool:
+def _verify_captcha(signed: str, answer: str) -> bool:
+    """校验令牌：过期时间 + 用"用户提交的答案"重算签名。
+
+    答错时签名自然对不上，所以不需要（也绝不能）把答案放进令牌里比对。
+    """
     try:
-        sig, answer = signed.split(":", 1)
-        expected = hmac.new(SECRET_KEY.encode(), answer.encode(), hashlib.sha256).hexdigest()[:16]
-        return hmac.compare_digest(sig, expected)
+        exp, nonce, mac = signed.split(":", 2)
+        if int(exp) < int(time.time()):
+            return False
+        return hmac.compare_digest(mac, _captcha_mac(exp, nonce, (answer or "").strip()))
     except Exception:
         return False
-
-_USED_CAPTCHAS: dict = {}   # signed -> 消耗时间戳（带过期清理，防内存无限增长）
-_CAPTCHA_TTL = 300          # 验证码有效期（秒）
 
 def _verify_captcha_flow(captcha_signed: str, captcha_answer: str):
     """校验并消耗验证码（供注册/找回密码共用），带过期清理"""
@@ -584,10 +816,9 @@ def _verify_captcha_flow(captcha_signed: str, captcha_answer: str):
             del _USED_CAPTCHAS[k]
     if not captcha_signed or not captcha_answer:
         raise HTTPException(400, "请输入验证码")
-    if not _verify_captcha(captcha_signed):
+    # 答案是否正确由签名判定，此处不再（也无法）从令牌里读出答案来比对
+    if not _verify_captcha(captcha_signed, captcha_answer):
         raise HTTPException(400, "验证码错误或已过期")
-    if captcha_answer.strip() != captcha_signed.split(":", 1)[1]:
-        raise HTTPException(400, "验证码答案错误")
     if captcha_signed in _USED_CAPTCHAS:
         raise HTTPException(400, "验证码已使用")
     _USED_CAPTCHAS[captcha_signed] = now
@@ -664,9 +895,17 @@ def _check_username(username: str):
     if not _USERNAME_RE.match(username):
         raise HTTPException(400, "用户名仅支持中英文、数字、下划线、连字符，最长30字符")
 
-def _check_password(password: str):
+def _check_password(password: str, enforce_min_len: bool = True):
+    """校验密码格式。
+
+    enforce_min_len=False 只用于登录：老用户可能存在很短的密码，
+    登录时必须放行，否则升级后会把人锁在门外。设置新密码时一律按
+    PASSWORD_MIN_LEN 要求。
+    """
     if not password or len(password) > 128:
         raise HTTPException(400, "密码需要1-128个字符")
+    if enforce_min_len and len(password) < PASSWORD_MIN_LEN:
+        raise HTTPException(400, f"密码至少需要 {PASSWORD_MIN_LEN} 个字符")
 
 def _check_qq(qq: str):
     if not _QQ_RE.match(qq):
@@ -759,7 +998,7 @@ async def signup(request: Request, username: str = Form(...), password: str = Fo
         try:
             cursor = await db.execute(
                 "INSERT INTO users (username, password, qq, created_at, pwd_changed_at) VALUES (?,?,?,?,?)",
-                (username, password, qq, now, now))
+                (username, _hash_password(password), qq, now, now))
             await db.commit()
         except sqlite3.IntegrityError:
             raise HTTPException(400, "注册失败，请重试")
@@ -778,17 +1017,31 @@ async def signup(request: Request, username: str = Form(...), password: str = Fo
 async def login(request: Request, username: str = Form(...), password: str = Form(...)):
     username = username.strip()
     _check_username(username)
-    _check_password(password)
+    # 登录不校验最小长度：老用户可能用着很短的旧密码，必须让人进得来
+    _check_password(password, enforce_min_len=False)
     ip = _client_ip(request)
     _rate_limit(f"login:{ip}", 10, 300)
     _rate_limit(f"login:{ip}:{username}", 5, 300)
     db = await get_db()
     try:
+        lock_key = username.lower()
+        remain = await _lock_remaining(db, "login", lock_key)
+        if remain > 0:
+            raise HTTPException(429, f"登录失败次数过多，请 {max(1, remain // 60)} 分钟后再试")
         row = await fetch_one(db, "SELECT * FROM users WHERE username=?", (username,))
-        if not row or row["password"] != password:
-            if not row:
-                _ = password + "unused_salt_for_timing"
+        # 用户不存在时用假哈希陪跑：两条分支都执行一次完整的 KDF，
+        # 避免用响应时间差探测用户名是否注册过。
+        pw_ok, needs_upgrade = _verify_password(row["password"] if row else _DUMMY_HASH, password)
+        if not row or not pw_ok:
+            await _record_failure(db, "login", lock_key)
             raise HTTPException(400, "用户名或密码错误")
+        await _clear_failures(db, "login", lock_key)
+        if needs_upgrade:
+            # 历史明文密码：登录成功即静默升级为哈希。
+            # 只改 password 一列、不动 pwd_changed_at，否则会把刚签发的会话作废。
+            await db.execute("UPDATE users SET password=? WHERE id=?",
+                             (_hash_password(password), row["id"]))
+            await db.commit()
         token = create_token(row["id"], row["pwd_changed_at"])
         jti = jwt.decode(token, SECRET_KEY, algorithms=["HS256"])["jti"]
         await _enforce_session_limit(row["id"], jti)
@@ -819,14 +1072,25 @@ async def get_me(request: Request):
 @app.put("/api/auth/password")
 async def change_password(request: Request):
     user = await get_current_user(request)
+    # 限流：防止拿到会话后无限次猜旧密码
+    _rate_limit(f"pwchange:u{user['id']}", 5, 300)
     data = await request.json()
-    new_password = (data.get("password") or "").strip()
+    old_password = data.get("old_password") or ""
+    new_password = (data.get("new_password") or "").strip()
+    # 必须验证旧密码：否则一次会话泄露（XSS / 设备被借用 / cookie 被窃）
+    # 就能直接改掉密码，把临时入侵变成永久接管。
+    old_ok, _ = _verify_password(user["password"], old_password)
+    if not old_ok:
+        raise HTTPException(400, "当前密码不正确")
     _check_password(new_password)
+    # 旧密码上面已验过，所以直接比两个提交值即可（省掉一次 KDF）
+    if _secret_equal(old_password, new_password):
+        raise HTTPException(400, "新密码不能与当前密码相同")
     db = await get_db()
     try:
         now = int(time.time())
         await db.execute("UPDATE users SET password=?, pwd_changed_at=? WHERE id=?",
-                         (new_password, now, user["id"]))
+                         (_hash_password(new_password), now, user["id"]))
         await db.execute("DELETE FROM sessions WHERE user_id=?", (user["id"],))
         await db.commit()
         return JSONResponse({"ok": True, "message": "密码已修改，请重新登录"})
@@ -889,12 +1153,21 @@ async def forgot_password(request: Request, username: str = Form(...), qq: str =
     _verify_captcha_flow(captcha_signed, captcha_answer)
     db = await get_db()
     try:
+        # 找回密码只凭"用户名 + 绑定的QQ"这两个静态信息，是全站最值得爆破的入口，
+        # 因此同样落库计数并锁定。
+        lock_key = username.lower()
+        remain = await _lock_remaining(db, "forgot", lock_key)
+        if remain > 0:
+            raise HTTPException(429, f"重置失败次数过多，请 {max(1, remain // 60)} 分钟后再试")
         row = await fetch_one(db, "SELECT * FROM users WHERE username=?", (username,))
-        if not row or row["qq"] != qq:
+        qq_ok = _secret_equal(row["qq"] if row else _DUMMY_SECRET, qq)
+        if not row or not qq_ok:
+            await _record_failure(db, "forgot", lock_key)
             raise HTTPException(400, "重置失败，请检查用户名与绑定的QQ")
+        await _clear_failures(db, "forgot", lock_key)
         now = int(time.time())
         await db.execute("UPDATE users SET password=?, pwd_changed_at=? WHERE id=?",
-                         (new_password, now, row["id"]))
+                         (_hash_password(new_password), now, row["id"]))
         await db.execute("DELETE FROM sessions WHERE user_id=?", (row["id"],))
         await db.commit()
         return JSONResponse({"ok": True, "message": "密码已重置，请使用新密码登录"})
