@@ -381,9 +381,44 @@ function appendReasoning(domId,text){
     if(!r){r=document.createElement('div');r.className='msg-reasoning';r.innerHTML='<div class="reasoning-bar" onclick="this.parentElement.classList.toggle(\'collapsed\')"><span>分析过程</span><span class="reasoning-arrow">▾</span></div><div class="reasoning-body"></div>';el.querySelector('.msg-content').before(r);}
     r.querySelector('.reasoning-body').textContent+=text;
 }
-function appendContent(domId,text){const el=document.getElementById(domId);if(!el)return;const c=el.querySelector('.msg-content');if(el.classList.contains('assistant')){if(!c.dataset.raw)c.dataset.raw='';c.dataset.raw+=text;c.textContent=c.dataset.raw;}else{if(['...','正在思考…','正在深度思考…','正在快速回复…'].includes(c.textContent))c.textContent='';c.textContent+=text;}}
-function updateMessage(domId,text){const el=document.getElementById(domId);if(!el)return;const c=el.querySelector('.msg-content');if(el.classList.contains('assistant')){c.dataset.raw=text;c.textContent=text;}else{c.textContent=text;}}
-function finalizeMarkdown(domId){const el=document.getElementById(domId);if(!el)return;const c=el.querySelector('.msg-content');if(c&&c.dataset.raw){c.innerHTML=renderMarkdown(c.dataset.raw);}}
+/* ===== 逐字显示（打字机效果）=====
+   服务端为了"生成与连接解耦"，每 0.6 秒才把进度镜像进数据库，转发层因此是
+   一批一批到达客户端的；照着批次直接整段渲染，看上去就是"整段蹦出来"。
+   这里在客户端做平滑：收到的字符先进缓冲区（dataset.raw 始终是完整文本，
+   复制功能不受影响），用 requestAnimationFrame 按稳定节奏往外吐，
+   积压越多吐字越快（永远追得上生成速度），生成结束时一次吐完再渲染 Markdown。 */
+const _REDUCE_MOTION=window.matchMedia&&window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+
+function _typerTick(c){
+  const t=c._typer;if(!t)return;
+  t.raf=0;
+  if(!c.isConnected){t.finished=true;return;}        // 消息已被重绘/删除，停止循环
+  const raw=c.dataset.raw||'';
+  const backlog=raw.length-c._shown;
+  if(backlog>0){
+    // 积压越多吐得越快：正常情况下 1 字/帧（约 60 字/秒，接近真人阅读节奏）
+    const n=backlog>200?Math.ceil(backlog/10):backlog>40?3:backlog>12?2:1;
+    c._shown=Math.min(raw.length,c._shown+n);
+    c.textContent=raw.slice(0,c._shown);
+    const now=Date.now();
+    if(now-(t.scrollAt||0)>100){t.scrollAt=now;scrollToBottom(true);}
+  }
+  if(c._shown<raw.length||!t.finished)t.raf=requestAnimationFrame(function(){_typerTick(c);});
+}
+function _typerEnsure(c){
+  if(c._shown===undefined)c._shown=0;
+  if(!c._typer)c._typer={raf:0,finished:false,scrollAt:0};
+  const t=c._typer;
+  if(_REDUCE_MOTION){_typerStop(c);c.textContent=c.dataset.raw||'';c._shown=(c.dataset.raw||'').length;return t;}
+  if(!t.raf)t.raf=requestAnimationFrame(function(){_typerTick(c);});
+  return t;
+}
+function _typerStop(c){const t=c._typer;if(t){t.finished=true;if(t.raf)cancelAnimationFrame(t.raf);t.raf=0;}}
+function _typerFlush(c){_typerStop(c);if(c.dataset.raw!==undefined){c._shown=(c.dataset.raw||'').length;c.textContent=c.dataset.raw;}}
+
+function appendContent(domId,text){const el=document.getElementById(domId);if(!el)return;const c=el.querySelector('.msg-content');if(el.classList.contains('assistant')){c.dataset.raw=(c.dataset.raw||'')+text;_typerEnsure(c);}else{if(['...','正在思考…','正在深度思考…','正在快速回复…'].includes(c.textContent))c.textContent='';c.textContent+=text;}}
+function updateMessage(domId,text){const el=document.getElementById(domId);if(!el)return;const c=el.querySelector('.msg-content');_typerStop(c);if(el.classList.contains('assistant')){c.dataset.raw=text;c.textContent=text;c._shown=text.length;}else{c.textContent=text;}}
+function finalizeMarkdown(domId){const el=document.getElementById(domId);if(!el)return;const c=el.querySelector('.msg-content');if(!c)return;_typerFlush(c);if(c.dataset.raw)c.innerHTML=renderMarkdown(c.dataset.raw);}
 
 function getMsgRawText(el){const c=el.querySelector('.msg-content');return c.dataset.raw!==undefined?c.dataset.raw:c.textContent||'';}
 function copyMsg(e){e.stopPropagation();e.preventDefault();var btn=e.currentTarget,msg=btn.closest('.message'),text=getMsgRawText(msg),done=function(){btn.innerHTML='<svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="#16a34a" stroke-width="3"><polyline points="20 6 9 17 4 12"/></svg>';setTimeout(function(){btn.innerHTML='<svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg>';},1500);};if(navigator.clipboard&&navigator.clipboard.writeText){navigator.clipboard.writeText(text).then(done).catch(function(){});}else{var ta=document.createElement('textarea');ta.value=text;ta.style.position='fixed';ta.style.left='-9999px';document.body.appendChild(ta);ta.select();try{document.execCommand('copy');done();}catch(_){}document.body.removeChild(ta);}}
