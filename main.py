@@ -35,8 +35,12 @@ PROVIDERS = {
     "deepseek": {
         "name": "DeepSeek",
         "base_url": "https://api.deepseek.com",
+        # 界面沿用用户熟悉的三个名字，老用户无感（旧的 localStorage 选择继续有效）。
+        # 真正发给上游的 ID 由 MODEL_API_IDS 翻译：deepseek-v4.1-flash -> deepseek-flash。
+        # 官方 api.deepseek.com 只提供 deepseek-flash(=V4.1-Flash) 与 deepseek-v4-pro；
+        # deepseek-v4-flash 已下线，旧名仍可调用并由 V4.1-Flash 提供服务。
         "models": ["deepseek-v4-pro", "deepseek-v4-flash", "deepseek-v4.1-flash"],
-        "default_model": "deepseek-v4-pro",
+        "default_model": "deepseek-v4.1-flash",
     },
     "qwen": {
         "name": "通义千问",
@@ -71,6 +75,19 @@ PROVIDERS = {
     },
 }
 
+# 界面模型名 -> 上游真实模型 ID 的翻译表。
+# 只对官方 DeepSeek 端点生效（见 _api_model）：第三方聚合商（OpenRouter 等）
+# 用的恰恰就是 deepseek-v4.1-flash 这种写法，必须原样透传，绝不能翻译。
+MODEL_API_IDS = {
+    "deepseek-v4.1-flash": "deepseek-flash",   # 官方把 V4.1-Flash 命名为 deepseek-flash
+}
+
+def _api_model(model: str, base_url: str) -> str:
+    """把界面上的模型名翻译成上游真正认识的 ID。"""
+    if "api.deepseek.com" in (base_url or ""):
+        return MODEL_API_IDS.get(model, model)
+    return model
+
 # ============================================================
 # 各模型上下文窗口（token 数，用于动态裁剪历史）
 # DeepSeek V4 官方参数：上下文长度 1M，最大输出 384K。
@@ -81,6 +98,7 @@ MODEL_CONTEXT_TOKENS = {
     "deepseek-v4-pro": 1_000_000,
     "deepseek-v4-flash": 1_000_000,
     "deepseek-v4.1-flash": 1_000_000,
+    "deepseek-flash": 1_000_000,
     "qwen3.7-max": 1_000_000, "qwen-max": 1_000_000,
     "qwen3.7-plus": 1_000_000, "qwen-plus": 1_000_000,
     "qwen3.6-flash": 1_000_000, "qwen-flash": 1_000_000,
@@ -408,7 +426,9 @@ async def init_db():
             "notice=CASE WHEN notice='' THEN '⚠️ 服务重启，本次生成中断，内容可能不完整' "
             "ELSE notice || '\n⚠️ 服务重启，本次生成中断，内容可能不完整' END "
             "WHERE status='streaming' AND content!='' AND created_at < ?", (_stale_before,))
-        await db.execute("DELETE FROM messages WHERE status IN ('streaming','error') AND created_at < ?",
+        # 只清理卡在 streaming 的残留行。
+        # status='error' 的行现在是"留在对话里的报错消息"，不能删。
+        await db.execute("DELETE FROM messages WHERE status='streaming' AND created_at < ?",
                          (_stale_before,))
         await db.commit()
     except Exception:
@@ -1053,8 +1073,10 @@ async def get_messages(chat_id: int, request: Request):
         row = await fetch_one(db, "SELECT * FROM chats WHERE id=? AND user_id=?", (chat_id, user["id"]))
         if not row:
             raise HTTPException(404, "对话不存在")
+        # 这里不过滤 status='error'：报错要作为一条消息留在对话里，不撤回。
+        # （喂给模型的上下文仍会排除 error 行，见下方 history 查询）
         msgs = await fetch_all(db,
-            "SELECT * FROM messages WHERE chat_id=? AND status!='error' ORDER BY created_at ASC, id ASC", (chat_id,))
+            "SELECT * FROM messages WHERE chat_id=? ORDER BY created_at ASC, id ASC", (chat_id,))
         return JSONResponse(msgs)
     finally:
         await db.close()
@@ -1309,7 +1331,8 @@ async def send_message(chat_id: int, request: Request):
                 # 重试循环：遇到上下文溢出时自动缩减消息重试
                 MAX_RETRIES = 5
                 for retry in range(MAX_RETRIES + 1):
-                    payload = {"model": model, "messages": current_messages, "stream": True}
+                    # 发给上游前把界面模型名翻译成真实 ID（如 deepseek-v4.1-flash -> deepseek-flash）
+                    payload = {"model": _api_model(model, base_url), "messages": current_messages, "stream": True}
                     # 深度分析开关：开 = 深度思考，关 = 快速回答（显式关闭思考）
                     if provider == "deepseek":
                         payload["thinking"] = {"type": "enabled" if deep_thinking else "disabled"}
