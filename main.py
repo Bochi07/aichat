@@ -256,6 +256,10 @@ MAX_SESSIONS = 5
 # 默认只信任本机，所以：若你的 nginx 与应用不在同一台机器，必须把 nginx 的 IP
 # 通过环境变量 TRUSTED_PROXIES 加进来，否则所有访客会被当成同一个来源。
 TRUSTED_PROXIES = {p.strip() for p in os.getenv("TRUSTED_PROXIES", "127.0.0.1,::1").split(",") if p.strip()}
+# 可选的"客户端 IP 专用头"（云 WAF/CDN 常见：CF-Connecting-IP、X-Real-IP 等）。
+# 只在直连方属于 TRUSTED_PROXIES 时才采信，留空则退回 X-Forwarded-For 解析。
+# ⚠️ 仅当你的代理/WAF 会**覆盖**该头时才安全；若它只是原样透传，客户端可以自己伪造。
+CLIENT_IP_HEADER = os.getenv("CLIENT_IP_HEADER", "").strip().lower()
 # 连续失败多少次后锁定 / 锁定时长（秒）
 LOCKOUT_THRESHOLD = 5
 LOCKOUT_SECONDS = 900
@@ -327,6 +331,7 @@ def _valid_ip(value: str) -> str:
         return ""
 
 _TRUST_PROXY_WARNED = False
+_RESOLVE_WARNED = False
 
 def _client_ip(request: Request) -> str:
     """返回真实客户端 IP。
@@ -334,21 +339,39 @@ def _client_ip(request: Request) -> str:
     X-Forwarded-For 是客户端可以随意伪造的请求头，因此只有"直连方本身
     是可信代理"时才采信它；并且从右往左取第一个非可信地址 —— 反向代理是
     把真实来源追加在最右侧的，客户端自己塞进去的值只会留在左边。
+
+    解析结果直接决定限流与失败锁定的归属：一旦所有访客都被解析成同一个
+    地址，他们就会互相挤占额度、互相影响，因此这里一旦发现"解析结果仍是
+    代理自己"就打警告。
     """
-    global _TRUST_PROXY_WARNED
+    global _TRUST_PROXY_WARNED, _RESOLVE_WARNED
     peer = _valid_ip(request.client.host if request.client else "") or "unknown"
     if peer not in TRUSTED_PROXIES:
-        # 直连方不可信：完全忽略 X-Forwarded-For
+        # 直连方不可信：完全忽略任何转发头
         if not _TRUST_PROXY_WARNED and request.headers.get("x-forwarded-for"):
             _TRUST_PROXY_WARNED = True
             print(f"[WARN] 直连方 {peer} 不在 TRUSTED_PROXIES 中，已忽略其 X-Forwarded-For。"
                   f"若本服务部署在反向代理之后，请把代理地址加入环境变量 TRUSTED_PROXIES，"
                   f"否则所有访客会被当成同一来源、共用同一份限流额度。")
         return peer
+    # 直连方可信：优先使用显式配置的客户端 IP 头（云 WAF 常用 CF-Connecting-IP 这类专用头）
+    if CLIENT_IP_HEADER:
+        ip = _valid_ip(request.headers.get(CLIENT_IP_HEADER, ""))
+        if ip:
+            return ip
     for part in reversed(request.headers.get("x-forwarded-for", "").split(",")):
         ip = _valid_ip(part)
         if ip and ip not in TRUSTED_PROXIES:
             return ip
+    xff = request.headers.get("x-forwarded-for", "")
+    if xff and not _RESOLVE_WARNED:
+        # 整条链路解析下来仍然只有可信代理 —— 通常说明中间的 WAF/CDN 地址
+        # 没有加进 TRUSTED_PROXIES，全部访客会被当成同一个人。
+        _RESOLVE_WARNED = True
+        print(f"[WARN] 客户端 IP 解析结果仍是可信代理地址（{peer}），X-Forwarded-For={xff!r}。"
+              f"这通常意味着链路中间的 WAF/CDN 地址没有加入 TRUSTED_PROXIES，"
+              f"所有访客会被当成同一来源、共用同一份限流与锁定额度（互相影响）。"
+              f"请把 WAF/CDN 地址加入 TRUSTED_PROXIES，或用 CLIENT_IP_HEADER 显式指定客户端 IP 头。")
     return peer
 
 def _rate_limit(key: str, limit: int, window: int):
@@ -598,31 +621,31 @@ async def _remove_session(jti: str):
         await db.close()
 
 # ============================================================
-# 密码哈希
+# 密码存储：明文（本项目特色）
 # ------------------------------------------------------------
-# 存储格式（参数写进字符串里，将来调整强度不会让老哈希失效）：
+# 新增 / 修改的密码一律按明文写入 users.password，管理上可直接查看。
+# 密码按 UTF-8 处理，所以中文、日文、emoji、任意符号都能正常使用
+#（这也正是不能把 str 直接丢给 hmac.compare_digest 的原因：它只接受纯 ASCII）。
+#
+# 同时保留对**历史哈希**的识别与校验。早期版本写入过下面两种格式：
 #   scrypt$n$r$p$<salt_hex>$<hash_hex>
 #   pbkdf2$<iterations>$<salt_hex>$<hash_hex>
-# 密码一律先按 UTF-8 编码再参与运算，所以中文、日文、emoji、任意符号
-# 都能正常作为密码使用（这也正是不能把 str 直接丢给 hmac.compare_digest 的原因：
-# 它只接受纯 ASCII）。
-#
-# 历史遗留的明文密码继续可用：_looks_hashed() 严格识别本站哈希格式，
-# 识别不出来的值一律按明文处理，并在该用户下次登录成功时静默升级为哈希。
+# 这类账号依然能用原密码登录，并且会在登录成功的那一刻自动写回明文：
+# 哈希本身不可逆，但登录时服务端正好拿到了明文，这是唯一无损还原的时机，
+# 所以老用户不需要重新设置密码，也不会被锁在门外。
+# 参数写在哈希串内，校验时从串里读，不依赖这里的常量。
 # ============================================================
-_SCRYPT_N, _SCRYPT_R, _SCRYPT_P = 2 ** 15, 8, 1     # 约 32MB 内存
+_SCRYPT_N, _SCRYPT_R, _SCRYPT_P = 2 ** 15, 8, 1
 # scrypt 需要 128*N*r 字节内存，OpenSSL 默认上限恰好是 32MB，会把 N=2^15 挡下来
-# （报 "memory limit exceeded"）。这里显式放行并留一倍余量。
+# （报 "memory limit exceeded"）。校验老哈希时显式放行并留一倍余量。
 _SCRYPT_MAXMEM = 128 * _SCRYPT_N * _SCRYPT_R * 2
-_PBKDF2_ITERATIONS = 600_000
-_SALT_BYTES = 16
 _HASH_DKLEN = 32
 
 def _scrypt_supported() -> bool:
-    """探测 scrypt 是否可用。
+    """探测 scrypt 是否可用（仅用于校验历史哈希）。
 
-    必须用与正式哈希**完全相同**的参数探测，否则会出现"探测通过、
-    正式调用却失败"——注册/改密当场 500。
+    用与早期版本写入时**完全相同**的参数探测，避免出现"探测通过、
+    真要校验时却失败"这种自相矛盾的结果。
     """
     try:
         hashlib.scrypt(b"probe", salt=b"probe", n=_SCRYPT_N, r=_SCRYPT_R, p=_SCRYPT_P,
@@ -632,29 +655,18 @@ def _scrypt_supported() -> bool:
         return False
 
 _HAS_SCRYPT = _scrypt_supported()
+if not _HAS_SCRYPT:
+    print("[WARN] 当前 OpenSSL 不支持 scrypt。密码已按明文存取，新密码不受影响；"
+          "但若库里还留有早期版本写入的 scrypt 哈希账号，这些账号将无法登录，"
+          "需要走一次「忘记密码」重设（重设后即恢复为明文）。")
 
 def _secret_equal(stored: str, submitted: str) -> bool:
-    """恒定时间比较（用于未哈希的值，如绑定的 QQ 号）。
+    """恒定时间比较（密码明文、绑定的 QQ 号都用它）。
 
     统一编码成 bytes 再比：hmac.compare_digest 对 str 只接受纯 ASCII，
     而本项目允许中文，直接传 str 会抛 TypeError。
     """
     return hmac.compare_digest((stored or "").encode("utf-8"), (submitted or "").encode("utf-8"))
-
-def _hash_password(password: str) -> str:
-    """生成带随机盐的密码哈希。"""
-    salt = os.urandom(_SALT_BYTES)
-    raw = password.encode("utf-8")
-    if _HAS_SCRYPT:
-        try:
-            dk = hashlib.scrypt(raw, salt=salt, n=_SCRYPT_N, r=_SCRYPT_R, p=_SCRYPT_P,
-                                dklen=_HASH_DKLEN, maxmem=_SCRYPT_MAXMEM)
-            return f"scrypt${_SCRYPT_N}${_SCRYPT_R}${_SCRYPT_P}${salt.hex()}${dk.hex()}"
-        except Exception:
-            # 运行环境临时不给用就退回 pbkdf2，绝不让注册/改密因此失败
-            pass
-    dk = hashlib.pbkdf2_hmac("sha256", raw, salt, _PBKDF2_ITERATIONS, dklen=_HASH_DKLEN)
-    return f"pbkdf2${_PBKDF2_ITERATIONS}${salt.hex()}${dk.hex()}"
 
 def _looks_hashed(stored: str) -> bool:
     """严格判断是否为本站生成的哈希串。
@@ -679,18 +691,19 @@ def _looks_hashed(stored: str) -> bool:
     return False
 
 def _verify_password(stored: str, submitted: str) -> tuple[bool, bool]:
-    """校验密码，返回 (是否正确, 是否需要升级为哈希)。
+    """校验密码，返回 (是否正确, 是否需要写回明文)。
 
-    老用户的明文密码在这条路径里同样是恒定时间比较，且一旦登录成功
-    就会被调用方改写成哈希，用户完全无感。
+    库里存的是明文时走恒定时间比较；存的是历史哈希时按串里的参数重新推导
+    再比对 —— 老密码照样能登录。第二项为 True 表示该行仍是哈希，
+    调用方应当在登录成功后把明文写回去，让"明文存储"不留死角。
     """
     if not _looks_hashed(stored):
-        return _secret_equal(stored, submitted), True
+        return _secret_equal(stored, submitted), False
     try:
         parts = stored.split("$")
         if parts[0] == "scrypt":
             _, n, r, p, salt_hex, hash_hex = parts
-            # 校验时必须同样放行内存：参数取自存储串，将来调整强度也不会让老哈希失效
+            # 校验时必须同样放行内存：参数取自存储串，与写入时的常量无关
             dk = hashlib.scrypt(submitted.encode("utf-8"), salt=bytes.fromhex(salt_hex),
                                 n=int(n), r=int(r), p=int(p), dklen=len(hash_hex) // 2,
                                 maxmem=max(_SCRYPT_MAXMEM, 128 * int(n) * int(r) * 2))
@@ -699,12 +712,9 @@ def _verify_password(stored: str, submitted: str) -> tuple[bool, bool]:
             dk = hashlib.pbkdf2_hmac("sha256", submitted.encode("utf-8"),
                                      bytes.fromhex(salt_hex), int(iterations),
                                      dklen=len(hash_hex) // 2)
-        return hmac.compare_digest(dk.hex(), hash_hex), False
+        return hmac.compare_digest(dk.hex(), hash_hex), True
     except Exception:
         return False, False
-
-# 用户不存在时，拿它跑一次完整的哈希校验，让"用户不存在"与"密码错误"耗时一致
-_DUMMY_HASH = _hash_password(_DUMMY_SECRET)
 
 # ============================================================
 # 认证失败锁定（防爆破）
@@ -723,7 +733,7 @@ _FAIL_PURGE_COUNTER = 0
 async def _record_failure(db, scope: str, key: str):
     """记一次失败；连续失败达到阈值即锁定。
 
-    key 用"提交上来的用户名"，不论该用户是否真实存在都记同样的账，
+    key 由调用方给出（用户名 + 来源 IP）。不论该用户是否真实存在都记同样的账，
     因此锁不锁定这件事本身不会泄露用户名是否已注册。
     """
     global _FAIL_PURGE_COUNTER
@@ -834,6 +844,17 @@ async def security_middleware(request: Request, call_next):
     response.headers["X-Content-Type-Options"] = "nosniff"
     response.headers["X-Frame-Options"] = "DENY"
     response.headers["Referrer-Policy"] = "strict-origin-when-cross-origin"
+    # ── 用户隔离的关键一环 ──────────────────────────────────
+    # 动态响应绝不能被浏览器 / 反向代理 / WAF / CDN 缓存或跨用户复用。
+    # 接口中间隔着缓存层时，"按 URL 缓存"会让下一个请求同一 URL 的
+    # 用户直接拿到上一个人的响应（/api/keys 返回完整 API Key、
+    # /api/chats/{id}/messages 返回完整聊天记录，一旦串号就是致命的）。
+    # no-store 禁止存储，Vary: Cookie 让忽略 no-store 的缓存也无法跨用户命中。
+    # 静态资源不含用户数据，保持可缓存。
+    if not request.url.path.startswith("/static/"):
+        response.headers["Cache-Control"] = "no-store, private"
+        response.headers["Vary"] = "Cookie"
+        response.headers["Pragma"] = "no-cache"
     response.headers["Content-Security-Policy"] = (
         "default-src 'self'; script-src 'self' 'unsafe-inline'; "
         "style-src 'self' 'unsafe-inline'; connect-src 'self'; "
@@ -998,7 +1019,7 @@ async def signup(request: Request, username: str = Form(...), password: str = Fo
         try:
             cursor = await db.execute(
                 "INSERT INTO users (username, password, qq, created_at, pwd_changed_at) VALUES (?,?,?,?,?)",
-                (username, _hash_password(password), qq, now, now))
+                (username, password, qq, now, now))
             await db.commit()
         except sqlite3.IntegrityError:
             raise HTTPException(400, "注册失败，请重试")
@@ -1024,23 +1045,26 @@ async def login(request: Request, username: str = Form(...), password: str = For
     _rate_limit(f"login:{ip}:{username}", 5, 300)
     db = await get_db()
     try:
-        lock_key = username.lower()
+        # 锁定键带上来源 IP：否则任何人只要知道你的用户名，故意失败 5 次
+        # 就能把你锁在门外 15 分钟 —— 那是用户之间互相影响，与隔离要求冲突。
+        lock_key = f"{username.lower()}|{ip}"
         remain = await _lock_remaining(db, "login", lock_key)
         if remain > 0:
             raise HTTPException(429, f"登录失败次数过多，请 {max(1, remain // 60)} 分钟后再试")
         row = await fetch_one(db, "SELECT * FROM users WHERE username=?", (username,))
-        # 用户不存在时用假哈希陪跑：两条分支都执行一次完整的 KDF，
+        # 用户不存在时用假凭据陪跑：两条分支都执行一次同样的比较，
         # 避免用响应时间差探测用户名是否注册过。
-        pw_ok, needs_upgrade = _verify_password(row["password"] if row else _DUMMY_HASH, password)
+        pw_ok, needs_plaintext = _verify_password(row["password"] if row else _DUMMY_SECRET, password)
         if not row or not pw_ok:
             await _record_failure(db, "login", lock_key)
             raise HTTPException(400, "用户名或密码错误")
         await _clear_failures(db, "login", lock_key)
-        if needs_upgrade:
-            # 历史明文密码：登录成功即静默升级为哈希。
-            # 只改 password 一列、不动 pwd_changed_at，否则会把刚签发的会话作废。
-            await db.execute("UPDATE users SET password=? WHERE id=?",
-                             (_hash_password(password), row["id"]))
+        if needs_plaintext:
+            # 该账号的密码还是历史哈希。哈希不可逆，但登录这一刻服务端正好
+            # 拿到了明文，所以直接写回明文 —— 老用户不需要重新设置密码，
+            # 也不会被锁在门外。只改 password 一列、不动 pwd_changed_at，
+            # 否则会把刚签发的会话作废。
+            await db.execute("UPDATE users SET password=? WHERE id=?", (password, row["id"]))
             await db.commit()
         token = create_token(row["id"], row["pwd_changed_at"])
         jti = jwt.decode(token, SECRET_KEY, algorithms=["HS256"])["jti"]
@@ -1090,7 +1114,7 @@ async def change_password(request: Request):
     try:
         now = int(time.time())
         await db.execute("UPDATE users SET password=?, pwd_changed_at=? WHERE id=?",
-                         (_hash_password(new_password), now, user["id"]))
+                         (new_password, now, user["id"]))
         await db.execute("DELETE FROM sessions WHERE user_id=?", (user["id"],))
         await db.commit()
         return JSONResponse({"ok": True, "message": "密码已修改，请重新登录"})
@@ -1149,13 +1173,14 @@ async def forgot_password(request: Request, username: str = Form(...), qq: str =
     _check_username(username)
     _check_password(new_password)
     _check_qq(qq)
-    _rate_limit(f"forgot:{_client_ip(request)}", 5, 300)
+    ip = _client_ip(request)
+    _rate_limit(f"forgot:{ip}", 5, 300)
     _verify_captcha_flow(captcha_signed, captcha_answer)
     db = await get_db()
     try:
         # 找回密码只凭"用户名 + 绑定的QQ"这两个静态信息，是全站最值得爆破的入口，
-        # 因此同样落库计数并锁定。
-        lock_key = username.lower()
+        # 因此同样落库计数并锁定；锁定键同样带来源 IP，避免跨用户互相锁。
+        lock_key = f"{username.lower()}|{ip}"
         remain = await _lock_remaining(db, "forgot", lock_key)
         if remain > 0:
             raise HTTPException(429, f"重置失败次数过多，请 {max(1, remain // 60)} 分钟后再试")
@@ -1167,7 +1192,7 @@ async def forgot_password(request: Request, username: str = Form(...), qq: str =
         await _clear_failures(db, "forgot", lock_key)
         now = int(time.time())
         await db.execute("UPDATE users SET password=?, pwd_changed_at=? WHERE id=?",
-                         (_hash_password(new_password), now, row["id"]))
+                         (new_password, now, row["id"]))
         await db.execute("DELETE FROM sessions WHERE user_id=?", (row["id"],))
         await db.commit()
         return JSONResponse({"ok": True, "message": "密码已重置，请使用新密码登录"})
@@ -1326,9 +1351,14 @@ async def delete_chat(chat_id: int, request: Request):
     user = await get_current_user(request)
     db = await get_db()
     try:
-        await db.execute(
-            "DELETE FROM messages WHERE chat_id IN (SELECT id FROM chats WHERE id=? AND user_id=?)",
-            (chat_id, user["id"]))
+        # 先确认归属：不属于自己的对话一律 404，与其他读取接口保持一致。
+        # （原先无论是否存在都回 ok=true，虽然数据没被删，但接口没有说真话，
+        #   也让"越权是否被拒绝"无法从响应上判定。）
+        row = await fetch_one(db, "SELECT id FROM chats WHERE id=? AND user_id=?",
+                              (chat_id, user["id"]))
+        if not row:
+            raise HTTPException(404, "对话不存在")
+        await db.execute("DELETE FROM messages WHERE chat_id=?", (chat_id,))
         await db.execute("DELETE FROM chats WHERE id=? AND user_id=?", (chat_id, user["id"]))
         await db.commit()
         return JSONResponse({"ok": True})
@@ -1796,9 +1826,13 @@ async def send_message(chat_id: int, request: Request):
         while True:
             d = await get_db()
             try:
+                # 带上归属条件：msg_id 是本次请求刚插入的行，正常情况下必然属于
+                # 当前用户；这里再校验一次是为了防止将来重构出"按 id 订阅"的
+                # 入口时，有人拿别人的 msg_id 订阅到别人的生成内容。
                 row = await fetch_one(d,
-                    "SELECT content, reasoning, notice, status, tokens_in, tokens_out FROM messages WHERE id=?",
-                    (msg_id,))
+                    "SELECT m.content, m.reasoning, m.notice, m.status, m.tokens_in, m.tokens_out"
+                    " FROM messages m JOIN chats c ON c.id = m.chat_id"
+                    " WHERE m.id=? AND c.user_id=?", (msg_id, user["id"]))
             finally:
                 await d.close()
             if row is None:
