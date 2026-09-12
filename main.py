@@ -35,7 +35,7 @@ PROVIDERS = {
     "deepseek": {
         "name": "DeepSeek",
         "base_url": "https://api.deepseek.com",
-        "models": ["deepseek-v4-pro", "deepseek-v4-flash"],
+        "models": ["deepseek-v4-pro", "deepseek-v4-flash", "deepseek-v4.1-flash"],
         "default_model": "deepseek-v4-pro",
     },
     "qwen": {
@@ -80,6 +80,7 @@ PROVIDERS = {
 MODEL_CONTEXT_TOKENS = {
     "deepseek-v4-pro": 1_000_000,
     "deepseek-v4-flash": 1_000_000,
+    "deepseek-v4.1-flash": 1_000_000,
     "qwen3.7-max": 1_000_000, "qwen-max": 1_000_000,
     "qwen3.7-plus": 1_000_000, "qwen-plus": 1_000_000,
     "qwen3.6-flash": 1_000_000, "qwen-flash": 1_000_000,
@@ -356,6 +357,8 @@ async def init_db():
             reasoning TEXT NOT NULL DEFAULT '',
             tokens_in INTEGER NOT NULL DEFAULT 0,
             tokens_out INTEGER NOT NULL DEFAULT 0,
+            status TEXT NOT NULL DEFAULT 'done',
+            notice TEXT NOT NULL DEFAULT '',
             created_at INTEGER NOT NULL,
             FOREIGN KEY (chat_id) REFERENCES chats(id) ON DELETE CASCADE
         );
@@ -382,6 +385,31 @@ async def init_db():
         pass
     try:
         await db.execute("ALTER TABLE messages ADD COLUMN tokens_out INTEGER NOT NULL DEFAULT 0")
+        await db.commit()
+    except Exception:
+        pass
+    # status: streaming=正在生成 / done=已完成 / error=失败(对外不可见) / cancelled=已请求中止
+    try:
+        await db.execute("ALTER TABLE messages ADD COLUMN status TEXT NOT NULL DEFAULT 'done'")
+        await db.commit()
+    except Exception:
+        pass
+    try:
+        await db.execute("ALTER TABLE messages ADD COLUMN notice TEXT NOT NULL DEFAULT ''")
+        await db.commit()
+    except Exception:
+        pass
+    # 进程重启后不可能有生成在进行：把残留的 streaming 行收尾。
+    # 只处理 10 分钟前的行，避免多 worker 场景下新 worker 启动时误伤其他 worker 正在生成的行。
+    _stale_before = int(time.time()) - 600
+    try:
+        await db.execute(
+            "UPDATE messages SET status='done', "
+            "notice=CASE WHEN notice='' THEN '⚠️ 服务重启，本次生成中断，内容可能不完整' "
+            "ELSE notice || '\n⚠️ 服务重启，本次生成中断，内容可能不完整' END "
+            "WHERE status='streaming' AND content!='' AND created_at < ?", (_stale_before,))
+        await db.execute("DELETE FROM messages WHERE status IN ('streaming','error') AND created_at < ?",
+                         (_stale_before,))
         await db.commit()
     except Exception:
         pass
@@ -646,6 +674,9 @@ def _check_api_key_format(key: str):
 
 _NO_CACHE = {"Cache-Control": "no-store, no-cache, must-revalidate, max-age=0",
              "Pragma": "no-cache", "Expires": "0"}
+
+# 后台生成任务的强引用集合：防止 asyncio 任务被垃圾回收提前取消
+_BG_TASKS = set()
 
 def _html(file_name: str):
     """读取 HTML 文件并以 UTF-8 编码返回"""
@@ -1023,7 +1054,7 @@ async def get_messages(chat_id: int, request: Request):
         if not row:
             raise HTTPException(404, "对话不存在")
         msgs = await fetch_all(db,
-            "SELECT * FROM messages WHERE chat_id=? ORDER BY created_at ASC", (chat_id,))
+            "SELECT * FROM messages WHERE chat_id=? AND status!='error' ORDER BY created_at ASC, id ASC", (chat_id,))
         return JSONResponse(msgs)
     finally:
         await db.close()
@@ -1041,6 +1072,27 @@ async def delete_message(msg_id: int, request: Request):
             raise HTTPException(404, "消息不存在")
         await db.execute("DELETE FROM messages WHERE id=?", (msg_id,))
         await db.commit()
+        return JSONResponse({"ok": True})
+    finally:
+        await db.close()
+
+@app.post("/api/messages/{msg_id}/cancel")
+async def cancel_message(msg_id: int, request: Request):
+    """请求中止生成。
+    生成任务可能跑在另一个 worker 里，所以中止信号经由数据库传递，
+    由生成任务在自己的刷新周期里读到 status='cancelled' 后主动收尾。"""
+    user = await get_current_user(request)
+    db = await get_db()
+    try:
+        row = await fetch_one(db, """
+            SELECT m.id, m.status FROM messages m JOIN chats c ON m.chat_id = c.id
+            WHERE m.id = ? AND c.user_id = ?
+        """, (msg_id, user["id"]))
+        if not row:
+            raise HTTPException(404, "消息不存在")
+        if row["status"] == "streaming":
+            await db.execute("UPDATE messages SET status='cancelled' WHERE id=?", (msg_id,))
+            await db.commit()
         return JSONResponse({"ok": True})
     finally:
         await db.close()
@@ -1092,8 +1144,12 @@ async def send_message(chat_id: int, request: Request):
             (chat_id, "user", message, "", 0, 0, now))
         await db.execute("UPDATE chats SET updated_at=? WHERE id=?", (now, chat_id))
         await db.commit()
+        # 必须带上 condensed / tokens_in / tokens_out：
+        # _msg_cost() 与 output_reserve 依赖真实 token 数，压缩版回填依赖 condensed。
+        # 之前只 SELECT role, content，导致这三处全部静默退化成估算。
         history = await fetch_all(db,
-            "SELECT role, content FROM messages WHERE chat_id=? ORDER BY created_at ASC", (chat_id,))
+            "SELECT role, content, condensed, tokens_in, tokens_out FROM messages"
+            " WHERE chat_id=? AND status!='error' ORDER BY created_at ASC, id ASC", (chat_id,))
     finally:
         await db.close()
 
@@ -1177,6 +1233,41 @@ async def send_message(chat_id: int, request: Request):
         openai_messages.append({"role": "system", "content": system_prompt})
     for m in kept:
         openai_messages.append({"role": m["role"], "content": m["content"]})
+
+    # ============================================================
+    # 生成与连接解耦
+    # ------------------------------------------------------------
+    # 先落一条 status='streaming' 的助手占位行，生成放到后台任务里跑，
+    # 只把进度/结果写进数据库；发给客户端的 SSE 仅“转发数据库中的增量”。
+    # 因此客户端切屏、断线、甚至关闭页面都不会中断生成，
+    # 回来后按数据库补拉即可看到完整回答。
+    # ============================================================
+    _ph = await get_db()
+    try:
+        _cur = await _ph.execute(
+            "INSERT INTO messages (chat_id, role, content, condensed, reasoning, tokens_in, tokens_out, status, notice, created_at)"
+            " VALUES (?,?,?,?,?,?,?,?,?,?)",
+            (chat_id, "assistant", "", "", "", 0, 0, "streaming", "", now))
+        msg_id = _cur.lastrowid
+        await _ph.commit()
+    finally:
+        await _ph.close()
+
+    async def _flush(content, reasoning, notice, status=None):
+        """把生成进度镜像到数据库，并返回当前 status（用于跨 worker 的中止信号）"""
+        d = await get_db()
+        try:
+            if status is None:
+                await d.execute("UPDATE messages SET content=?, reasoning=?, notice=? WHERE id=?",
+                                (content, reasoning, notice, msg_id))
+            else:
+                await d.execute("UPDATE messages SET content=?, reasoning=?, notice=?, status=? WHERE id=?",
+                                (content, reasoning, notice, status, msg_id))
+            await d.commit()
+            row = await fetch_one(d, "SELECT status FROM messages WHERE id=?", (msg_id,))
+            return (row or {}).get("status") or "streaming"
+        finally:
+            await d.close()
 
     # 上下文溢出关键词检测
     _CTX_OVERFLOW_RE = re.compile(
@@ -1306,11 +1397,16 @@ async def send_message(chat_id: int, request: Request):
                 condensed = _condense_text(save_content) if len(save_content) > 200 else ""
                 db2 = await get_db()
                 try:
-                    cur = await db2.execute(
-                        "INSERT INTO messages (chat_id, role, content, condensed, reasoning, tokens_in, tokens_out, created_at) VALUES (?,?,?,?,?,?,?,?)",
-                        (chat_id, "assistant", save_content, condensed,
-                         reasoning_text if deep_thinking else "", tokens_in, tokens_out, int(time.time())))
-                    msg_id = cur.lastrowid
+                    # 占位行已提前插入（msg_id），此处改为更新。
+                    # error_msg 非空 = 上游中途断流：手上只有半截内容，必须如实标注，
+                    # 不能把被截断的回答当成完整回答交给用户。
+                    _warn = f"\n⚠️ 回答未完整生成（{error_msg[:120]}）" if error_msg else ""
+                    await db2.execute(
+                        "UPDATE messages SET content=?, condensed=?, reasoning=?, tokens_in=?, tokens_out=?, status='done',"
+                        " notice=CASE WHEN ?='' THEN notice ELSE notice || ? END WHERE id=?",
+                        (save_content, condensed,
+                         reasoning_text if deep_thinking else "", tokens_in, tokens_out,
+                         _warn, _warn, msg_id))
                     await db2.execute("UPDATE chats SET updated_at=? WHERE id=?", (int(time.time()), chat_id))
 
                     # 将 API 返回的真实 prompt_tokens 按比例分配到每条输入消息
@@ -1331,13 +1427,127 @@ async def send_message(chat_id: int, request: Request):
                     await db2.commit()
                 finally:
                     await db2.close()
-                if msg_id:
-                    yield f"data: {json.dumps({'saved_id': msg_id, 'tokens_in': tokens_in, 'tokens_out': tokens_out, 'window_pct': round(window_pct)})}\n\n"
-            elif not success and not error_msg:
-                yield f"data: {json.dumps({'error': '模型上下文不足，多次重试均失败，请缩短对话或更换模型'})}\n\n"
-            yield "data: [DONE]\n\n"
+            else:
+                # 失败 / 空响应：把占位行标记为 error。
+                # error 行对 UI（get_messages）与后续上下文（history）均不可见，
+                # 仅用于让转发端知道该收尾了，保持与改造前一致的“失败不留痕”行为。
+                if not error_msg:
+                    error_msg = '模型上下文不足，多次重试均失败，请缩短对话或更换模型'
+                _de = await get_db()
+                try:
+                    # 只写纯错误文本：客户端会自己加“❌ ”前缀，避免出现两个 ❌
+                    await _de.execute("UPDATE messages SET content=?, status='error' WHERE id=?",
+                                      (error_msg, msg_id))
+                    await _de.commit()
+                finally:
+                    await _de.close()
+            # ⚠️ 这里绝不能 yield。
+            # 中止/断线时本生成器会被 aclose()，在 GeneratorExit 期间 yield 会抛
+            # "async generator ignored GeneratorExit"，导致收尾写到一半就中断。
+            # 客户端需要的终态事件（saved_id / error / [DONE]）全部由 _tail 依据数据库状态生成。
 
-    return StreamingResponse(stream_response(), media_type="text/event-stream")
+    async def _pump():
+        """在后台驱动生成，并把进度镜像进数据库。
+        它与客户端连接完全无关：切屏、断线、关页面都不会让它停下来。"""
+        content, reasoning, notice = "", "", ""
+        last_flush = 0.0
+        gen = stream_response()
+        try:
+            async for line in gen:
+                if not line.startswith("data: "):
+                    continue
+                chunk = line[6:].strip()
+                # 不在这里 break：要一直迭代到生成器自然结束，
+                # 这样它 finally 里的最终落库（status='done'）才会一定执行
+                if chunk == "[DONE]":
+                    continue
+                try:
+                    d = json.loads(chunk)
+                except Exception:
+                    continue
+                if d.get("content"):
+                    content += d["content"]
+                if d.get("reasoning"):
+                    reasoning += d["reasoning"]
+                if d.get("notice"):
+                    notice = (notice + "\n" + d["notice"]) if notice else d["notice"]
+                _now = time.time()
+                if _now - last_flush > 0.6:
+                    last_flush = _now
+                    if (await _flush(content, reasoning, notice)) == "cancelled":
+                        # 有 worker 收到了中止请求（经由数据库传递）：异步关闭生成器走收尾
+                        await gen.aclose()
+                        break
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            await _flush(content or f"❌ 请求异常: {str(e)[:300]}", reasoning, notice, "error")
+        # 兜底：确保占位行一定落到终态，否则前端会永远停在“生成中”
+        _dg = await get_db()
+        try:
+            _r = await fetch_one(_dg, "SELECT status FROM messages WHERE id=?", (msg_id,))
+        finally:
+            await _dg.close()
+        if _r and _r["status"] in ("streaming", "cancelled"):
+            await _flush(content or "模型未返回内容", reasoning, notice,
+                         "done" if content else "error")
+
+    async def _tail():
+        """只把数据库里的增量转发给客户端。客户端断开不影响生成。"""
+        yield f"data: {json.dumps({'streaming_id': msg_id})}\n\n"
+        sent_c = sent_r = sent_n = 0
+        idle_since = time.time()
+        while True:
+            d = await get_db()
+            try:
+                row = await fetch_one(d,
+                    "SELECT content, reasoning, notice, status, tokens_in, tokens_out FROM messages WHERE id=?",
+                    (msg_id,))
+            finally:
+                await d.close()
+            if row is None:
+                yield f"data: {json.dumps({'error': '生成记录已失效，请重新发送'})}\n\n"
+                yield "data: [DONE]\n\n"
+                return
+            status = row["status"] or "done"
+            if status == "error":
+                # 失败：只报一次错，不把错误文本再当作正文/提示推给前端
+                yield f"data: {json.dumps({'error': (row['content'] or '') or '模型未返回内容'})}\n\n"
+                yield "data: [DONE]\n\n"
+                return
+            content = row["content"] or ""
+            reasoning = row["reasoning"] or ""
+            notice = row["notice"] or ""
+            if len(notice) > sent_n:
+                yield f"data: {json.dumps({'notice': notice[sent_n:]})}\n\n"
+                sent_n = len(notice)
+            if len(reasoning) > sent_r:
+                yield f"data: {json.dumps({'reasoning': reasoning[sent_r:]})}\n\n"
+                sent_r = len(reasoning)
+                idle_since = time.time()
+            if len(content) > sent_c:
+                yield f"data: {json.dumps({'content': content[sent_c:]})}\n\n"
+                sent_c = len(content)
+                idle_since = time.time()
+            if status != "done":
+                # streaming / cancelled：生成还在继续
+                if time.time() - idle_since > 300:
+                    yield f"data: {json.dumps({'error': '生成超时（长时间无新内容），请重试'})}\n\n"
+                    yield "data: [DONE]\n\n"
+                    return
+                await asyncio.sleep(0.25)
+                continue
+            if not content:
+                yield f"data: {json.dumps({'error': '模型未返回内容'})}\n\n"
+            else:
+                yield f"data: {json.dumps({'saved_id': msg_id, 'tokens_in': row['tokens_in'] or 0, 'tokens_out': row['tokens_out'] or 0, 'window_pct': round(window_pct)})}\n\n"
+            yield "data: [DONE]\n\n"
+            return
+
+    _task = asyncio.create_task(_pump())
+    _BG_TASKS.add(_task)
+    _task.add_done_callback(_BG_TASKS.discard)
+    return StreamingResponse(_tail(), media_type="text/event-stream")
 
 # ============================================================
 # 启动
