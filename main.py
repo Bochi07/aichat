@@ -909,7 +909,9 @@ async def inject_user(request: Request, call_next):
 # 输入校验
 # ============================================================
 _USERNAME_RE = re.compile(r'^[\w\u4e00-\u9fff\-]{1,30}$')
-_MODEL_RE = re.compile(r'^[a-zA-Z0-9\-_\.]{1,64}$')
+# 模型名：既接受各厂商官方 ID（可能含 . - _ / : @ +，如 meta-llama/Llama-3.1:8b），
+# 也接受实时列表 / 手动输入的写法；仍禁止空白、引号、控制字符等危险内容。
+_MODEL_RE = re.compile(r'^[\w\-\.\/:@+]{1,120}$')
 _QQ_RE = re.compile(r'^\d{5,11}$')
 
 def _check_username(username: str):
@@ -1275,11 +1277,154 @@ async def delete_key(provider: str, request: Request):
 # ============================================================
 @app.get("/api/providers")
 async def list_providers():
-    """返回所有提供商及其模型"""
+    """返回所有提供商及其模型（此处 models 仅作首屏秒开的预设列表；
+    实时可用模型请走 /api/models，见下方"实时模型列表"）"""
     return JSONResponse({
         pid: {"name": pinfo["name"], "models": pinfo["models"], "default_model": pinfo["default_model"]}
         for pid, pinfo in PROVIDERS.items()
     })
+
+# ============================================================
+# 实时模型列表
+# 各厂商上线/下线模型很频繁，硬编码的预设列表很快就会过期。
+# 这里用用户自己保存的密钥，实时调用厂商的 OpenAI 兼容 /models 接口，
+# 拉取"当前真正可用"的模型；拉不到（未配 Key / 厂商不支持 / 网络异常）
+# 时静默回退到预设列表，前端不会有任何中断。
+# ============================================================
+_MODELS_CACHE = {}              # (uid, provider, base_url, key指纹) -> (过期时间, 模型列表, 来源, 提示)
+MODELS_CACHE_TTL = 300          # 实时结果缓存 5 分钟：来回切换厂商时不必反复打上游
+MODELS_FAIL_CACHE_TTL = 30      # 失败结果短暂缓存 30 秒：防止用户狂点刷新把上游打爆
+
+def _models_url_candidates(base_url: str) -> list[str]:
+    """构造可能的模型列表端点（各厂商 base_url 有的带 /v1，有的不带）。"""
+    base = (base_url or "").rstrip("/")
+    candidates = [base + "/models"]
+    if not base.endswith("/v1"):
+        candidates.append(base + "/v1/models")
+    seen, out = set(), []
+    for url in candidates:
+        if url not in seen:
+            seen.add(url)
+            out.append(url)
+    return out
+
+def _normalize_model_list(obj) -> list[str]:
+    """把各厂商五花八门的返回格式统一成模型 ID 列表。
+    兼容：OpenAI 风格 {"data":[{"id":...}]}、{"models":[...]}、纯数组等。"""
+    items = None
+    if isinstance(obj, list):
+        items = obj
+    elif isinstance(obj, dict):
+        for key in ("data", "models", "model_list", "result"):
+            value = obj.get(key)
+            if isinstance(value, list):
+                items = value
+                break
+            if isinstance(value, dict):
+                inner = value.get("models") or value.get("data")
+                if isinstance(inner, list):
+                    items = inner
+                    break
+    if not items:
+        return []
+    out = []
+    for item in items:
+        if isinstance(item, str):
+            mid = item
+        elif isinstance(item, dict):
+            mid = item.get("id") or item.get("model") or item.get("name")
+        else:
+            mid = None
+        if isinstance(mid, str):
+            mid = mid.strip()
+            if mid and len(mid) <= 120 and mid not in out:
+                out.append(mid)
+    return out
+
+async def _fetch_remote_models(base_url: str, api_key: str) -> tuple[list[str], str]:
+    """请求厂商的 /models 接口。成功返回 (模型列表, "")，失败返回 ([], 失败原因)。"""
+    headers = {"Authorization": f"Bearer {api_key}"}
+    last_err = "厂商未提供模型列表接口"
+    async with aiohttp.ClientSession() as session:
+        for url in _models_url_candidates(base_url):
+            try:
+                async with session.get(url, headers=headers,
+                                       timeout=aiohttp.ClientTimeout(total=15)) as resp:
+                    if resp.status != 200:
+                        last_err = f"HTTP {resp.status}"
+                        continue
+                    try:
+                        # content_type=None：部分厂商返回的 Content-Type 不规范，强制按 JSON 解析
+                        body = await resp.json(content_type=None)
+                    except Exception:
+                        last_err = "接口返回的不是 JSON"
+                        continue
+                    models = _normalize_model_list(body)
+                    if models:
+                        return models, ""
+                    last_err = "接口没有返回任何模型"
+            except asyncio.TimeoutError:
+                last_err = "请求超时"
+            except Exception as e:
+                last_err = f"请求异常: {str(e)[:100]}"
+    return [], last_err
+
+@app.get("/api/models")
+async def list_models(request: Request, provider: str = "", refresh: int = 0):
+    """实时获取某厂商当前可用的模型列表。
+
+    返回 {provider, models, source, message}：
+      source=live   模型列表来自厂商接口（实时）
+      source=preset 实时获取失败，回退到内置预设列表（message 说明原因）
+    """
+    user = await get_current_user(request)
+    if provider not in PROVIDERS:
+        raise HTTPException(400, "未知提供商")
+    _rate_limit(f"models:u{user['id']}", 60, 60)
+
+    preset = PROVIDERS[provider]["models"]
+    provider_name = PROVIDERS[provider]["name"]
+
+    def _preset_response(msg: str):
+        return JSONResponse({"provider": provider, "models": preset,
+                             "source": "preset", "message": msg})
+
+    db = await get_db()
+    try:
+        key_row = await fetch_one(db,
+            "SELECT api_key, base_url FROM api_keys WHERE user_id=? AND provider=? LIMIT 1",
+            (user["id"], provider))
+    finally:
+        await db.close()
+    if not key_row:
+        return _preset_response(f"未配置 {provider_name} 密钥，显示预设列表")
+
+    base_url = key_row["base_url"] or PROVIDERS[provider]["base_url"]
+    # 缓存键带 Key 指纹：用户换了 Key 之后不会拿到旧 Key 拉出来的列表
+    key_fp = hashlib.sha256((key_row["api_key"] or "").encode()).hexdigest()[:10]
+    cache_key = (user["id"], provider, base_url, key_fp)
+    now = time.time()
+
+    if len(_MODELS_CACHE) > 200:   # 简易清理，避免长期运行内存无限增长
+        for k in [k for k, v in list(_MODELS_CACHE.items()) if v[0] <= now]:
+            del _MODELS_CACHE[k]
+
+    if not refresh:
+        cached = _MODELS_CACHE.get(cache_key)
+        if cached and cached[0] > now:
+            return JSONResponse({"provider": provider, "models": cached[1],
+                                 "source": cached[2], "message": cached[3]})
+
+    models, err = await _fetch_remote_models(base_url, key_row["api_key"])
+    if models:
+        msg = f"已从 {provider_name} 接口实时获取 {len(models)} 个可用模型"
+        _MODELS_CACHE[cache_key] = (now + MODELS_CACHE_TTL, models, "live", msg)
+        return JSONResponse({"provider": provider, "models": models,
+                             "source": "live", "message": msg})
+
+    msg = f"实时获取失败（{err}），显示预设列表"
+    _MODELS_CACHE[cache_key] = (now + MODELS_FAIL_CACHE_TTL, preset, "preset", msg)
+    return _preset_response(msg)
 
 # ============================================================
 # 聊天管理

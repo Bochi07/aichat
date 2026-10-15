@@ -207,6 +207,14 @@ textarea.input { resize: vertical; min-height: 60px; }
     cursor: pointer;
 }
 .model-select:focus { border-color: var(--primary); }
+/* 模型列表刷新按钮：拉取中时旋转 */
+.model-refresh {
+    font-size: 16px; line-height: 1; padding: 4px 6px;
+    flex-shrink: 0; color: var(--text-secondary);
+}
+.model-refresh:disabled { cursor: default; }
+.model-refresh.spin { animation: model-refresh-spin .9s linear infinite; }
+@keyframes model-refresh-spin { to { transform: rotate(360deg); } }
 .think-toggle {
     display: flex; align-items: center; gap: 4px;
     font-size: 13px; color: var(--text-secondary);

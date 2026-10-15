@@ -137,7 +137,8 @@ window.renderMarkdown=function(text){
         </header>
         <div class="model-bar">
             <select id="provider-select" class="model-select" onchange="onProviderChange()"></select>
-            <select id="model-select" class="model-select" onchange="savePrefs()"></select>
+            <select id="model-select" class="model-select" onchange="onModelChange()"></select>
+            <button type="button" class="btn-icon model-refresh" id="btn-refresh-models" onclick="refreshModels()" title="重新获取可用模型">⟳</button>
             <label class="think-toggle" id="think-label">
                 <input type="checkbox" id="deep-think" onchange="savePrefs()"> 深度分析
             </label>
@@ -167,6 +168,9 @@ let currentChatId=null,abortController=null,currentMessageIds={},searchTimer=nul
 let sidebarOpen=!window.matchMedia('(max-width:1023px)').matches;
 const PROVIDER_LIST=['deepseek','qwen','ernie','mimo'];
 let PROVIDERS={},providerModels={};
+let modelCache={};                  // pid -> {models, source, message, ts}，前端缓存，切厂商不用反复请求
+const MODEL_CACHE_TTL=5*60*1000;    // 与后端缓存时长保持一致
+const MANUAL_MODEL='__manual__';    // 下拉框里“手动输入模型名”的哨兵值
 
 async function loadProviders(){
     const resp=await fetch('api/providers');
@@ -176,28 +180,114 @@ async function loadProviders(){
     const saved=localStorage.getItem('provider')||'deepseek';
     sel.value=saved in PROVIDERS?saved:'deepseek';
     document.getElementById('deep-think').checked=localStorage.getItem('deepThink')==='true';
-    onProviderChange(false);
+    await onProviderChange(false);
 }
-function onProviderChange(save=true){
-    const pid=document.getElementById('provider-select').value;
-    providerModels=PROVIDERS[pid]?PROVIDERS[pid].models:[];
-    const def=PROVIDERS[pid]?PROVIDERS[pid].default_model:providerModels[0]||'';
-    const sel=document.getElementById('model-select');
-    sel.innerHTML=providerModels.map(m=>`<option value="${m}">${m}</option>`).join('');
-    // 按厂商分别记住上次选的模型。
-    // 旧版只有一个全局 model 键，切到别的厂商就会被覆盖，
-    // 切回来只剩默认模型 —— 用户会以为“我选的模型没生效”。
+
+function savedModelFor(pid){
     let savedModel=localStorage.getItem('model:'+pid);
     if(!savedModel&&localStorage.getItem('provider')===pid)savedModel=localStorage.getItem('model');
-    sel.value=(savedModel&&providerModels.includes(savedModel))?savedModel:def;
+    return savedModel||'';
+}
+
+/* 用真实列表重建模型下拉框（DOM 方式逐项写入，模型名里带特殊字符也不会串 HTML）。
+   “✎ 手动输入模型名…”永远排在最后，厂商接口没列出来的模型也能自己填。 */
+function setModelOptions(models,selected,source){
+    const sel=document.getElementById('model-select');
+    sel.innerHTML='';
+    models.forEach(function(m){const o=document.createElement('option');o.value=m;o.textContent=m;sel.appendChild(o);});
+    const mo=document.createElement('option');mo.value=MANUAL_MODEL;mo.textContent='✎ 手动输入模型名…';sel.appendChild(mo);
+    const pick=(selected&&models.indexOf(selected)>=0)?selected:(models[0]||'');
+    if(pick)sel.value=pick;
+    sel.dataset.source=source||'preset';
+    sel.title=source==='live'?'模型列表已从厂商接口实时获取':(source==='preset'?'当前显示预设列表（实时获取未生效）':'');
+    return pick;
+}
+
+async function onProviderChange(save=true){
+    const pid=document.getElementById('provider-select').value;
+    providerModels=PROVIDERS[pid]?PROVIDERS[pid].models:[];
+    const def=PROVIDERS[pid]?PROVIDERS[pid].default_model:(providerModels[0]||'');
+    // 策略：先用预设列表把下拉框秒填上（网络再慢也不空着），
+    // 随后再用厂商接口返回的实时列表刷新；两者对用户是无缝的。
+    const savedModel=savedModelFor(pid);
+    const seed=providerModels.slice();
+    // 按厂商分别记住上次选的模型，保证上次的选择一直在候选里
+    if(savedModel&&seed.indexOf(savedModel)<0)seed.unshift(savedModel);
+    setModelOptions(seed,savedModel||def,'preset');
     document.getElementById('think-label').style.display=(pid==='deepseek'||pid==='mimo'||pid==='qwen')?'':'none';
     if(save)savePrefs();
+    // 命中前端缓存则直接用缓存刷新，否则请求后端（后端还有 5 分钟缓存）
+    const cached=modelCache[pid];
+    if(cached&&Date.now()-cached.ts<MODEL_CACHE_TTL){applyModels(pid,cached);return;}
+    await fetchModels(pid,false);
 }
+
+/* 请求实时模型列表。force=true 时绕过缓存（刷新按钮）。 */
+async function fetchModels(pid,force){
+    const btn=document.getElementById('btn-refresh-models');
+    if(btn){btn.classList.add('spin');btn.disabled=true;}
+    try{
+        const resp=await fetch('api/models?provider='+encodeURIComponent(pid)+(force?'&refresh=1':''));
+        if(!resp.ok)return;
+        const data=await resp.json();
+        const info={models:data.models||[],source:data.source||'preset',message:data.message||'',ts:Date.now()};
+        modelCache[pid]=info;
+        applyModels(pid,info);
+    }catch(_){/* 静默失败：保持当前列表，绝不打断聊天 */}
+    finally{if(btn){btn.classList.remove('spin');btn.disabled=false;}}
+}
+
+/* 把实时列表应用到下拉框，并尽量保住用户已有的选择 */
+function applyModels(pid,info){
+    // 请求期间用户可能已经切到别的厂商 / 别的会话，过期的响应直接丢弃
+    if(document.getElementById('provider-select').value!==pid)return;
+    if(!info.models||!info.models.length)return;
+    const sel=document.getElementById('model-select');
+    const cur=sel.value;
+    let models=info.models.slice();
+    // 当前选中的（手动输入的、老预设名的）不在实时列表里 → 保留在最前面，避免“我的选择被吃掉”
+    if(cur&&cur!==MANUAL_MODEL&&models.indexOf(cur)<0)models.unshift(cur);
+    const saved=savedModelFor(pid);
+    if(saved&&models.indexOf(saved)<0)models.unshift(saved);
+    const keep=(cur&&cur!==MANUAL_MODEL)?cur:(saved||models[0]||'');
+    setModelOptions(models,keep,info.source);
+    const btn=document.getElementById('btn-refresh-models');
+    if(btn&&info.message)btn.title=info.message;
+    if(info.message)sel.title=info.message;
+}
+
+function refreshModels(){
+    const pid=document.getElementById('provider-select').value;
+    delete modelCache[pid];
+    fetchModels(pid,true);
+}
+
+/* 下拉框 change：正常模型直接保存；选中“手动输入”则弹框填写 */
+function onModelChange(){
+    const sel=document.getElementById('model-select');
+    const pid=document.getElementById('provider-select').value;
+    if(sel.value!==MANUAL_MODEL){savePrefs();return;}
+    const prev=savedModelFor(pid)||'';
+    const input=prompt('输入模型名（将原样发送给厂商接口）',prev);
+    if(input===null||!input.trim()){sel.value=prev||(sel.options[0]?sel.options[0].value:'');return;}
+    const name=input.trim();
+    if(!/^[\w\-\.\/:@+]{1,120}$/.test(name)){alert('模型名格式不正确（不含空格及特殊符号）');sel.value=prev||(sel.options[0]?sel.options[0].value:'');return;}
+    if(!Array.from(sel.options).some(function(o){return o.value===name;})){
+        const o=document.createElement('option');o.value=name;o.textContent=name;
+        sel.insertBefore(o,sel.options[sel.options.length-1]);   // 插到“手动输入”选项之前
+    }
+    sel.value=name;
+    savePrefs();
+}
+
 function savePrefs(){
     const pid=document.getElementById('provider-select').value;
     localStorage.setItem('provider',pid);
-    localStorage.setItem('model:'+pid,document.getElementById('model-select').value);
-    localStorage.setItem('model',document.getElementById('model-select').value);
+    const mv=document.getElementById('model-select').value;
+    if(mv&&mv!==MANUAL_MODEL){
+        localStorage.setItem('model:'+pid,mv);
+        localStorage.setItem('model',mv);
+    }
     localStorage.setItem('deepThink',document.getElementById('deep-think').checked);
 }
 loadProviders();loadChats();applySidebarState();
