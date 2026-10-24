@@ -171,6 +171,23 @@ let PROVIDERS={},providerModels={};
 let modelCache={};                  // pid -> {models, source, message, ts}，前端缓存，切厂商不用反复请求
 const MODEL_CACHE_TTL=5*60*1000;    // 与后端缓存时长保持一致
 const MANUAL_MODEL='__manual__';    // 下拉框里“手动输入模型名”的哨兵值
+// SSE 看门狗：连心跳算在内，超过这么久一个字节都没收到，就判定这条通道已经废了。
+// 服务端生成与连接是解耦的，此时转去轮询数据库照样能拿到完整内容 ——
+// 这样即使中间隔着不转发流式数据的代理（默认 nginx / 各类 CDN / 手机运营商 NAT），
+// 也不需要动任何 nginx 配置就能正常用。
+const SSE_STALL_MS=30000;
+const SSE_READ_TICK=4000;           // 读超时切片：不能干等，要定期醒来判断是否停滞
+
+/* 带超时的 stream 读取。超时只是"醒来看一眼"，不表示出错。 */
+function readWithTimeout(reader,ms){
+    return new Promise(resolve=>{
+        const timer=setTimeout(()=>resolve({__timeout:true}),ms);
+        reader.read().then(
+            v=>{clearTimeout(timer);resolve(v);},
+            e=>{clearTimeout(timer);resolve({__error:e});}
+        );
+    });
+}
 
 async function loadProviders(){
     const resp=await fetch('api/providers');
@@ -356,8 +373,11 @@ function renderMessage(m){
     // 用户消息：纯文本；AI 消息：渲染 Markdown
     const rendered=isUser?escHtml(m.content).replace(/\n/g,'<br>'):(isError?('❌ '+escHtml(m.content)).replace(/\n/g,'<br>'):renderMarkdown(m.content));
     const tIn=isError?0:(m.tokens_in||0),tOut=isError?0:(m.tokens_out||0);
-    const tokenHtml=(!isUser&&(tIn||tOut))?`<div class="msg-tokens">⬆ ${fmtTok(tIn)} · ⬇ ${fmtTok(tOut)} · 共 ${fmtTok(tIn+tOut)}</div>`:'';
-    return`<div class="message ${m.role}" id="${domId}"><div class="msg-header"><span class="msg-role">${isUser?'我':'助手'}</span>${isStreaming?'<span style="font-size:11px;color:#94a3b8;margin-left:6px">生成中…</span>':''}<button class="msg-del" onclick="deleteMessage(${m.id},'${domId}')">✕</button></div>${hasR?`<div class="msg-reasoning collapsed"><div class="reasoning-bar" onclick="this.parentElement.classList.toggle('collapsed')"><span>分析过程</span><span class="reasoning-arrow">▾</span></div><div class="reasoning-body">${escHtml(m.reasoning)}</div></div>`:''}<div class="msg-content"${isError?' style="color:#dc2626"':''}>${rendered}</div>${tokenHtml}<button class="msg-copy" onclick="copyMsg(event)" title="复制"><svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg></button></div>`;
+    const tokenHtml=(!isUser&&(tIn||tOut))?`<span class="msg-tokens">⬆ ${fmtTok(tIn)} · ⬇ ${fmtTok(tOut)} · 共 ${fmtTok(tIn+tOut)}</span>`:'';
+    // 气泡脚注：时间 + token 统计，样式刻意做淡，不抢正文注意力
+    const timeHtml=`<span class="msg-time" data-ts="${m.created_at||0}">${formatMsgTime(m.created_at)}</span>`;
+    const footHtml=`<div class="msg-foot">${timeHtml}${tokenHtml}</div>`;
+    return`<div class="message ${m.role}" id="${domId}"><div class="msg-header"><span class="msg-role">${isUser?'我':'助手'}</span>${isStreaming?'<span style="font-size:11px;color:#94a3b8;margin-left:6px">生成中…</span>':''}<button class="msg-del" onclick="deleteMessage(${m.id},'${domId}')">✕</button></div>${hasR?`<div class="msg-reasoning collapsed"><div class="reasoning-bar" onclick="this.parentElement.classList.toggle('collapsed')"><span>分析过程</span><span class="reasoning-arrow">▾</span></div><div class="reasoning-body">${escHtml(m.reasoning)}</div></div>`:''}<div class="msg-content"${isError?' style="color:#dc2626"':''}>${rendered}</div>${footHtml}<button class="msg-copy" onclick="copyMsg(event)" title="复制"><svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg></button></div>`;
 }
 
 
@@ -395,7 +415,7 @@ async function sendMessage(e){
     const userDomId=appendMessage('user',message);
     const aiDomId=appendMessage('assistant','',deepThink?'正在深度思考…':'正在快速回复…');
     abortController=new AbortController();
-    let savedId=null;
+    let savedId=null,savedTs=0;
     currentStreamingId=null;stopPoll();
     try{
         const resp=await fetch('api/chats/'+currentChatId+'/send',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({message,provider,model,deep_thinking:deepThink}),signal:abortController.signal});
@@ -408,6 +428,7 @@ async function sendMessage(e){
         }
         const reader=resp.body.getReader(),decoder=new TextDecoder();
         let buffer='',hasReasoning=false,lastScroll=0;
+        let lastByteAt=Date.now(),stalled=false;
         const flushLines=()=>{
             const lines=buffer.split('\n');
             buffer=lines.pop()||'';
@@ -418,11 +439,12 @@ async function sendMessage(e){
                 try{
                     const d=JSON.parse(chunk);
                     if(d.streaming_id!==undefined)currentStreamingId=d.streaming_id;
-                    if(d.error)updateMessage(aiDomId,'❌ '+d.error);
+                    if(d.error)showStreamProblem(aiDomId,d.error);
                     else if(d.notice)showNotice(d.notice,aiDomId);
                     else if(d.reasoning&&deepThink){hasReasoning=true;appendReasoning(aiDomId,d.reasoning);}
                     else if(d.content)appendContent(aiDomId,d.content);
                     if(d.saved_id!==undefined){savedId=d.saved_id;}
+                    if(d.created_at!==undefined){savedTs=d.created_at;}
                     if(d.tokens_in!==undefined){showTokens(aiDomId,d.tokens_in,d.tokens_out);}
                     if(d.window_pct>=90){showNotice('⚠️ 对话上下文已使用约 '+d.window_pct+'%，继续对话将开始省略更早内容',aiDomId);}
                     const now=Date.now();if(now-lastScroll>80){lastScroll=now;scrollToBottom(true);}
@@ -430,15 +452,39 @@ async function sendMessage(e){
             }
             return false;
         };
-        while(true){const{done,value}=await reader.read();if(done)break;buffer+=decoder.decode(value,{stream:true});if(flushLines())break;}
+        // 读循环带看门狗：正常通道每 10s 至少有一个心跳字节；
+        // 一旦超时阈值内一个字节都没有（代理把流缓冲住了 / 连接被悄悄掐断），
+        // 就放弃这条通道转轮询，而不是让用户干等一个永远不更新的气泡。
+        while(true){
+            const r=await readWithTimeout(reader,SSE_READ_TICK);
+            if(r&&r.__timeout){
+                if(Date.now()-lastByteAt>SSE_STALL_MS){stalled=true;break;}
+                continue;
+            }
+            if(r&&r.__error){showStreamProblem(aiDomId,r.__error.message||'连接中断');break;}
+            const{done,value}=r;
+            if(done)break;
+            lastByteAt=Date.now();
+            buffer+=decoder.decode(value,{stream:true});
+            if(flushLines())break;
+        }
+        if(stalled){try{await reader.cancel();}catch(_){}}
         flushLines();
         scrollToBottom(false);
         finalizeMarkdown(aiDomId);
         if(hasReasoning){const r=document.getElementById(aiDomId)&&document.getElementById(aiDomId).querySelector('.msg-reasoning');if(r)r.classList.add('collapsed');}
-        if(savedId){const el=document.getElementById(aiDomId);if(el){el.id='msg-'+savedId;currentMessageIds[el.id]=savedId;const h=el.querySelector('.msg-header');if(h&&!h.querySelector('.msg-del')){const b=document.createElement('button');b.className='msg-del';b.textContent='✕';b.setAttribute('onclick','deleteMessage('+savedId+',\''+el.id+'\')');h.appendChild(b);}}}
-        if(!savedId)await refreshMessages();
-    }catch(err){if(err.name!=='AbortError')updateMessage(aiDomId,'❌ '+err.message);await refreshMessages();}
-    abortController=null;if(!resuming)setSendState(false);loadChats();
+        if(savedId){
+            if(savedTs)setMsgTime(aiDomId,savedTs);
+            const el=document.getElementById(aiDomId);if(el){el.id='msg-'+savedId;currentMessageIds[el.id]=savedId;const h=el.querySelector('.msg-header');if(h&&!h.querySelector('.msg-del')){const b=document.createElement('button');b.className='msg-del';b.textContent='✕';b.setAttribute('onclick','deleteMessage('+savedId+',\''+el.id+'\')');h.appendChild(b);}}
+        }
+        // 没拿到 saved_id 通常意味着连接被中间层切断（收到的是 done 而非错误），
+        // 而不是生成失败 —— 必须补拉一次判断是否转为轮询。
+        else resumeIfStillGenerating(aiDomId,await refreshMessages());
+    }catch(err){
+        if(err.name!=='AbortError')showStreamProblem(aiDomId,err.message);
+        resumeIfStillGenerating(aiDomId,await refreshMessages());
+    }
+    abortController=null;if(!resuming&&!pollTimer)setSendState(false);loadChats();
 }
 
 function setSendState(s){document.getElementById('btn-send').style.display=s?'none':'inline-block';document.getElementById('btn-stop').style.display=s?'inline-block':'none';}
@@ -461,7 +507,10 @@ function appendMessage(role,content,placeholder){
     div.className='message '+role;div.id=domId;
     const isUser=role==='user';
     const display=isUser?escHtml(content).replace(/\n/g,'<br>'):(placeholder||'正在思考…');
-    div.innerHTML=`<div class="msg-header"><span class="msg-role">${isUser?'我':'助手'}</span></div><div class="msg-content"${isUser?'':' data-raw=""'}>${display}</div><button class="msg-copy" onclick="copyMsg(event)" title="复制"><svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg></button>`;
+    // 先用本地时间占位，服务端落库后会用真实 created_at 校正（见 saved_id 处理）
+    const tmpTs=Math.floor(Date.now()/1000);
+    const footHtml=`<div class="msg-foot"><span class="msg-time" data-ts="${tmpTs}">${formatMsgTime(tmpTs)}</span></div>`;
+    div.innerHTML=`<div class="msg-header"><span class="msg-role">${isUser?'我':'助手'}</span></div><div class="msg-content"${isUser?'':' data-raw=""'}>${display}</div>${footHtml}<button class="msg-copy" onclick="copyMsg(event)" title="复制"><svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg></button>`;
     el.appendChild(div);scrollToBottom(false);return domId;
 }
 
@@ -514,7 +563,28 @@ function getMsgRawText(el){const c=el.querySelector('.msg-content');return c.dat
 function copyMsg(e){e.stopPropagation();e.preventDefault();var btn=e.currentTarget,msg=btn.closest('.message'),text=getMsgRawText(msg),done=function(){btn.innerHTML='<svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="#16a34a" stroke-width="3"><polyline points="20 6 9 17 4 12"/></svg>';setTimeout(function(){btn.innerHTML='<svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg>';},1500);};if(navigator.clipboard&&navigator.clipboard.writeText){navigator.clipboard.writeText(text).then(done).catch(function(){});}else{var ta=document.createElement('textarea');ta.value=text;ta.style.position='fixed';ta.style.left='-9999px';document.body.appendChild(ta);ta.select();try{document.execCommand('copy');done();}catch(_){}document.body.removeChild(ta);}}
 
 function renderMsgs(msgs){currentMessageIds={};const el=document.getElementById('messages');el.innerHTML=msgs.length?msgs.map(m=>renderMessage(m)).join(''):'<div class="empty-state"><p>开始实验吧</p></div>';}
-async function refreshMessages(){if(!currentChatId)return;const resp=await fetch('api/chats/'+currentChatId+'/messages'),msgs=await resp.json();renderMsgs(msgs);}
+async function refreshMessages(){
+    if(!currentChatId)return[];
+    try{
+        const resp=await fetch('api/chats/'+currentChatId+'/messages'),msgs=await resp.json();
+        if(!Array.isArray(msgs))return[];
+        renderMsgs(msgs);return msgs;
+    }catch(_){return[];}   // 拉不到也不能把发送按钮卡在"中止"状态
+}
+/* 生成出问题时：已有半截正文就只加一条提示，绝不把正文冲掉。
+   断流/超时大多发生在生成中途，那半截内容对用户是有价值的。 */
+function showStreamProblem(domId,text){
+    const el=document.getElementById(domId),c=el&&el.querySelector('.msg-content');
+    if(c&&c.dataset.raw&&c.dataset.raw.trim())showNotice('⚠️ '+text,domId);
+    else updateMessage(domId,'❌ '+text);
+}
+/* 连接被中间层切断后，服务端往往还在生成：若数据库里仍是 streaming 就转轮询补拉，
+   否则半截内容会永远停在"生成中"再也不更新。 */
+function resumeIfStillGenerating(domId,msgs){
+    if(msgs&&msgs.some(m=>m.role==='assistant'&&(m.status==='streaming'||m.status==='cancelled'))){startPoll();return true;}
+    currentStreamingId=null;
+    return false;
+}
 
 function stopPoll(){if(pollTimer){clearInterval(pollTimer);pollTimer=null;}}
 function startPoll(){
@@ -590,12 +660,34 @@ function fmtTok(n){n=Number(n)||0;return n.toLocaleString('en-US');}
 function showTokens(domId,tokensIn,tokensOut){
     const el=document.getElementById(domId);if(!el)return;
     const tIn=Number(tokensIn)||0,tOut=Number(tokensOut)||0;
-    let t=el.querySelector('.msg-tokens');
-    if(!t){t=document.createElement('div');t.className='msg-tokens';el.appendChild(t);}
+    let foot=el.querySelector('.msg-foot');
+    if(!foot){foot=document.createElement('div');foot.className='msg-foot';el.appendChild(foot);}
+    let t=foot.querySelector('.msg-tokens');
+    if(!t){t=document.createElement('span');t.className='msg-tokens';foot.appendChild(t);}
     t.textContent='⬆ '+fmtTok(tIn)+' · ⬇ '+fmtTok(tOut)+' · 共 '+fmtTok(tIn+tOut);
+}
+/* 用服务端真实 created_at 校正气泡时间（本地占位时间可能偏早） */
+function setMsgTime(domId,ts){
+    const el=document.getElementById(domId);if(!el||!ts)return;
+    let s=el.querySelector('.msg-time');
+    if(!s){
+        let foot=el.querySelector('.msg-foot');
+        if(!foot){foot=document.createElement('div');foot.className='msg-foot';el.appendChild(foot);}
+        s=document.createElement('span');s.className='msg-time';foot.insertBefore(s,foot.firstChild);
+    }
+    s.dataset.ts=ts;s.textContent=formatMsgTime(ts);
 }
 function escHtml(s){const d=document.createElement('div');d.textContent=s;return d.innerHTML;}
 function formatDate(ts){const d=new Date(ts*1000),n=new Date();if(d.toDateString()===n.toDateString())return d.toLocaleTimeString('zh-CN',{hour:'2-digit',minute:'2-digit'});return d.toLocaleDateString('zh-CN',{month:'short',day:'numeric'});}
+/* 气泡脚注时间：今天只显示时分，今年显示"M月D日 时分"，跨年才带年份 */
+function formatMsgTime(ts){
+    ts=Number(ts)||0;if(!ts)return'';
+    const d=new Date(ts*1000),n=new Date(),p=x=>(x<10?'0'+x:''+x);
+    const hm=p(d.getHours())+':'+p(d.getMinutes());
+    if(d.toDateString()===n.toDateString())return hm;
+    if(d.getFullYear()===n.getFullYear())return(d.getMonth()+1)+'月'+d.getDate()+'日 '+hm;
+    return d.getFullYear()+'-'+p(d.getMonth()+1)+'-'+p(d.getDate())+' '+hm;
+}
 async function logout(){await fetch('api/auth/logout',{method:'POST'});window.location.href='login';}
 </script>
 </body>

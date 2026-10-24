@@ -16,7 +16,7 @@ import time
 import uuid
 from collections import defaultdict, deque
 from datetime import datetime, timedelta
-from urllib.parse import urlparse
+from urllib.parse import urlparse, quote
 
 import aiohttp
 import jwt
@@ -26,7 +26,7 @@ try:
 except ImportError:
     tiktoken = None
 from fastapi import FastAPI, Request, HTTPException, Form
-from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse, RedirectResponse
+from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse, RedirectResponse, Response
 from fastapi.staticfiles import StaticFiles
 
 # ============================================================
@@ -119,7 +119,13 @@ MODEL_CONTEXT_TOKENS = {
 }
 
 def _get_context_window(model: str) -> int:
-    """返回指定模型的上下文窗口 token 数"""
+    """返回指定模型的上下文窗口 token 数。
+
+    以模型自身上限为上限，服务端不再额外打折；需要统一指定时用
+    环境变量 CONTEXT_WINDOW_TOKENS 覆盖。
+    """
+    if CONTEXT_WINDOW_OVERRIDE and CONTEXT_WINDOW_OVERRIDE > 0:
+        return CONTEXT_WINDOW_OVERRIDE
     return MODEL_CONTEXT_TOKENS.get(model, CONTEXT_FALLBACK_TOKENS)
 
 # re 模块已在文件顶部导入
@@ -209,9 +215,10 @@ def _condense_text(text: str) -> str:
 
     condensed = "\n\n".join(parts) if parts else plain[:800]
 
-    # 如果压缩后还是太长，截断到最后一个完整段落（保留 60%）
-    if _estimate_tokens(condensed) > est_tokens * 0.6:
-        condensed = plain[:int(len(plain) * 0.6)]
+    # 兜底截断。保留比例偏高（85%）：上下文以"尽量少丢信息"为先，
+    # 宁可多占一些窗口，也不要把关键内容切掉导致模型答非所问。
+    if _estimate_tokens(condensed) > est_tokens * 0.85:
+        condensed = plain[:int(len(plain) * 0.85)]
 
     return condensed if condensed else text[:800]
 
@@ -271,6 +278,33 @@ _DUMMY_SECRET = "0" * 64
 OUTPUT_RESERVE_TOKENS_BASE = 1024   # 输出预留基础值（动态调整）
 CONTEXT_FALLBACK_TOKENS = 1_000_000   # 未列出的模型默认窗口（统一 1M）
 CONTEXT_SAFETY_BUFFER = 200          # 安全余量（降低以最大化利用上下文）
+
+# ── 上下文：本项目不在服务端人为压低窗口 ────────────────────────
+# 窗口一律取"模型自身上限"（上表），能塞多少历史就塞多少。
+# 另有环境变量 CONTEXT_WINDOW_TOKENS 可强制指定（留空/0 表示按上表取值）。
+CONTEXT_WINDOW_OVERRIDE = int(os.getenv("CONTEXT_WINDOW_TOKENS", "0") or 0)
+
+# ── 单次输出上限 ────────────────────────────────────────────
+# 不显式指定时，各厂商按自己的默认值截断（部分厂商默认只有 4096 token），
+# 这是"话说到一半就没了"最常见的来源之一。这里显式给一个足够大的值，
+# 可用环境变量 MAX_OUTPUT_TOKENS 继续调大；若厂商不接受该值会自动退回其默认。
+MAX_OUTPUT_TOKENS = int(os.getenv("MAX_OUTPUT_TOKENS", "8192") or 8192)
+
+# ── 上游流式读取超时 ────────────────────────────────────────
+# 只限制"两次数据之间的间隔"，不再限制整次请求总时长 ——
+# total 会把长回答在跑到上限时硬切断，必须关掉。
+UPSTREAM_SOCK_READ_TIMEOUT = int(os.getenv("UPSTREAM_SOCK_READ_TIMEOUT", "120") or 120)
+
+# ── SSE 心跳 ───────────────────────────────────────────────
+# 反向代理（nginx 默认 60s）与浏览器只看"有没有字节经过"，不看是不是正文。
+# 不发心跳的话上游稍微慢一点，连接就被中间层悄悄切断 —— 表现为话说到一半没了。
+# 取 10s：对 60s 的代理超时有 6 倍余量，也够短，能让前端尽快察觉通道已断。
+# 本项目的目标是"不动 nginx 就能用"，所以心跳必须比任何常见代理超时都密。
+SSE_PING_INTERVAL = 10
+# 转发层判死的空闲时长：心跳只保证链路活着，内容长时间无增长才算真异常。
+TAIL_IDLE_TIMEOUT = int(os.getenv("TAIL_IDLE_TIMEOUT", "600") or 600)
+# 上下文溢出时的重试次数：改用"先压缩、再逐步少量丢弃"，尽量少丢历史。
+OVERFLOW_MAX_RETRIES = 8
 
 # 项目自带的公开占位密钥（见 Dockerfile / docker-compose.yml）。
 # 用它们启动等于把签名密钥公之于众，因此与"未设置"同等对待，一律拒绝启动。
@@ -396,6 +430,9 @@ async def get_db() -> aiosqlite.Connection:
     db.row_factory = aiosqlite.Row
     await db.execute("PRAGMA journal_mode=WAL")
     await db.execute("PRAGMA foreign_keys=ON")
+    # 多 worker 并发写时给足排队等待时间。缺了它，写冲突会直接抛
+    # "database is locked"，进而让整条正在生成的消息被判成失败/半截。
+    await db.execute("PRAGMA busy_timeout=10000")
     return db
 
 async def fetch_all(db: aiosqlite.Connection, sql: str, params: tuple = ()):
@@ -1568,6 +1605,119 @@ async def cancel_message(msg_id: int, request: Request):
         await db.close()
 
 # ============================================================
+# 聊天记录导出（Markdown）
+# ------------------------------------------------------------
+# 越权是这个功能唯一的致命风险，因此两条铁律贯穿始终：
+#   1. 用户身份只认 get_current_user()（cookie + sessions 表校验后的 user_id），
+#      绝不接受请求体/查询串里传来的任何 user 标识；
+#   2. 每一条 SQL 都带 user_id 条件。chats 用 "id=? AND user_id=?"，
+#      messages 经 JOIN chats 兜底校验归属 —— 别人的 chat_id 一律 404，
+#      不存在"猜 id 就能导出别人对话"的可能。
+# ============================================================
+EXPORT_MAX_CHARS = 2_000_000   # 单份导出的字符上限，防止极端大对话撑爆内存
+
+def _fmt_ts(ts) -> str:
+    try:
+        return datetime.fromtimestamp(int(ts or 0)).strftime("%Y-%m-%d %H:%M")
+    except Exception:
+        return ""
+
+def _safe_filename(title: str) -> str:
+    """把对话标题规整成安全文件名（去掉路径分隔符与控制字符）。"""
+    name = re.sub(r'[\\/:*?"<>|\r\n\t]', "_", (title or "").strip())
+    name = name.strip(" .")[:60]
+    return name or "未命名对话"
+
+def _build_chat_markdown(chat: dict, msgs: list, username: str, with_reasoning: bool) -> str:
+    """把一次对话拼成 Markdown。消息正文原样保留（本来就是 Markdown）。"""
+    title = (chat.get("title") or "").strip() or "未命名对话"
+    out = [f"# {title}", ""]
+    out.append(f"> 导出时间：{datetime.now().strftime('%Y-%m-%d %H:%M')}")
+    if username:
+        out.append(f"> 用户：{username}")
+    if chat.get("created_at"):
+        out.append(f"> 创建时间：{_fmt_ts(chat['created_at'])}")
+    if chat.get("updated_at"):
+        out.append(f"> 最后更新：{_fmt_ts(chat['updated_at'])}")
+    out.append(f"> 消息数：{len(msgs)}")
+    out.append("")
+
+    sp = (chat.get("system_prompt") or "").strip()
+    if sp:
+        out += ["## 实验参数", "", sp, ""]
+    out += ["---", ""]
+
+    for m in msgs:
+        # 报错行只是失败记录，不是对话内容，不进导出
+        if m.get("status") == "error":
+            continue
+        role = "我" if m.get("role") == "user" else "助手"
+        ts = _fmt_ts(m.get("created_at"))
+        out.append(f"### {role} · {ts}" if ts else f"### {role}")
+        out.append("")
+        reasoning = (m.get("reasoning") or "").strip()
+        if with_reasoning and reasoning:
+            out += ["<details><summary>分析过程</summary>", "", reasoning, "", "</details>", ""]
+        content = (m.get("content") or "").strip()
+        out.append(content if content else "_（无内容）_")
+        out.append("")
+
+    text = "\n".join(out).rstrip() + "\n"
+    if len(text) > EXPORT_MAX_CHARS:
+        text = text[:EXPORT_MAX_CHARS] + "\n\n> ⚠️ 内容过长，已截断。\n"
+    return text
+
+@app.get("/api/export/chats")
+async def export_list_chats(request: Request):
+    """列出当前用户自己的对话，供导出时选择。"""
+    user = await get_current_user(request)
+    _rate_limit(f"export:u{user['id']}", 60, 60)
+    db = await get_db()
+    try:
+        chats = await fetch_all(db, """
+            SELECT c.id, c.title, c.created_at, c.updated_at,
+                   (SELECT COUNT(*) FROM messages m WHERE m.chat_id = c.id) AS msg_count
+            FROM chats c
+            WHERE c.user_id = ?
+            ORDER BY c.updated_at DESC, c.id DESC
+        """, (user["id"],))
+    finally:
+        await db.close()
+    return JSONResponse(chats)
+
+@app.get("/api/export/chats/{chat_id}")
+async def export_chat_md(chat_id: int, request: Request, reasoning: int = 0):
+    """导出指定对话为 Markdown 文件。不属于当前用户的对话一律 404。"""
+    user = await get_current_user(request)
+    _rate_limit(f"export:u{user['id']}", 60, 60)
+    db = await get_db()
+    try:
+        chat = await fetch_one(db, "SELECT * FROM chats WHERE id=? AND user_id=?",
+                               (chat_id, user["id"]))
+        if not chat:
+            raise HTTPException(404, "对话不存在")
+        # 二次校验归属：即便 chat_id 是猜的，这里也只取得到属于本人的消息
+        msgs = await fetch_all(db, """
+            SELECT m.role, m.content, m.reasoning, m.created_at, m.status
+            FROM messages m JOIN chats c ON c.id = m.chat_id
+            WHERE m.chat_id = ? AND c.user_id = ?
+            ORDER BY m.created_at ASC, m.id ASC
+        """, (chat_id, user["id"]))
+    finally:
+        await db.close()
+
+    md = _build_chat_markdown(chat, msgs, user.get("username") or "", bool(reasoning))
+    fn = _safe_filename(chat.get("title")) + ".md"
+    # 中文文件名：ASCII 兜底 + RFC 5987 的 filename*（各浏览器都认后者）。
+    # 兜底名用 id，避免中文标题被下划线替换成一串没有意义的符号。
+    ascii_fn = f"chat-{chat_id}.md"
+    resp = Response(content=md, media_type="text/markdown; charset=utf-8")
+    resp.headers["Content-Disposition"] = (
+        f'attachment; filename="{ascii_fn}"; filename*=UTF-8\'\'{quote(fn)}'
+    )
+    return resp
+
+# ============================================================
 # AI 聊天
 # ============================================================
 @app.post("/api/chats/{chat_id}/send")
@@ -1673,13 +1823,16 @@ async def send_message(chat_id: int, request: Request):
         rescued = []
         rescue_used = 0
         rescue_budget = budget * 0.4  # 提高到 40%，塞回更多历史
-        for m in dropped:
+        # 从"较新"的一端往回救：越靠近当前对话的历史越值得保留。
+        for m in reversed(dropped):
             content = m.get("condensed") or _condense_text(m.get("content") or "")
             cost = _estimate_tokens(content)
             if rescue_used + cost > rescue_budget:
                 break
             rescued.append({"role": m["role"], "content": content})
             rescue_used += cost
+        # 上面是"新→旧"收集的，翻回来才是"旧→新"的时间顺序。
+        # （少了这一步，塞回模型的历史会整段倒序 —— 这是原先的 bug。）
         rescued.reverse()
         kept = rescued + kept
         used += rescue_used
@@ -1724,20 +1877,34 @@ async def send_message(chat_id: int, request: Request):
         await _ph.close()
 
     async def _flush(content, reasoning, notice, status=None):
-        """把生成进度镜像到数据库，并返回当前 status（用于跨 worker 的中止信号）"""
-        d = await get_db()
-        try:
-            if status is None:
-                await d.execute("UPDATE messages SET content=?, reasoning=?, notice=? WHERE id=?",
-                                (content, reasoning, notice, msg_id))
-            else:
-                await d.execute("UPDATE messages SET content=?, reasoning=?, notice=?, status=? WHERE id=?",
-                                (content, reasoning, notice, status, msg_id))
-            await d.commit()
-            row = await fetch_one(d, "SELECT status FROM messages WHERE id=?", (msg_id,))
-            return (row or {}).get("status") or "streaming"
-        finally:
-            await d.close()
+        """把生成进度镜像到数据库，并返回当前 status（用于跨 worker 的中止信号）。
+
+        写库失败会直接中断生成（进度停在旧内容上），所以这里对可恢复的
+        SQLite 错误重试几次：Windows 上 WAL 文件偶尔被杀软/索引器短暂锁住、
+        多 worker 抢写，都属于重试一次就好，不该让用户承担一次截断。
+        """
+        last_err = None
+        for attempt in range(3):
+            d = await get_db()
+            try:
+                if status is None:
+                    await d.execute("UPDATE messages SET content=?, reasoning=?, notice=? WHERE id=?",
+                                    (content, reasoning, notice, msg_id))
+                else:
+                    await d.execute("UPDATE messages SET content=?, reasoning=?, notice=?, status=? WHERE id=?",
+                                    (content, reasoning, notice, status, msg_id))
+                await d.commit()
+                row = await fetch_one(d, "SELECT status FROM messages WHERE id=?", (msg_id,))
+                return (row or {}).get("status") or "streaming"
+            except sqlite3.OperationalError as e:
+                last_err = e
+                await asyncio.sleep(0.2 * (attempt + 1))
+            except sqlite3.DatabaseError as e:
+                # 表损坏 / 非 Operational 类错误，重试没有意义，直接抛出
+                raise e
+            finally:
+                await d.close()
+        raise last_err
 
     # 上下文溢出关键词检测
     _CTX_OVERFLOW_RE = re.compile(
@@ -1760,6 +1927,9 @@ async def send_message(chat_id: int, request: Request):
         error_msg = ""
         usage_capture = {}   # 上游若返回 usage 则记录真实 token 数
         success = False      # 是否成功获得响应
+        finish_reason = ""   # 上游给出的结束原因（length = 撞到输出上限被截断）
+        use_max_tokens = True  # 厂商不接受时置 False，退回其默认值
+        condensed_try = False  # 上下文溢出时是否已试过"压缩而非丢弃"
 
         # 自动回退：当前发送的消息列表（可能因重试而缩减）
         current_messages = list(openai_messages)
@@ -1777,10 +1947,13 @@ async def send_message(chat_id: int, request: Request):
                 }
 
                 # 重试循环：遇到上下文溢出时自动缩减消息重试
-                MAX_RETRIES = 5
-                for retry in range(MAX_RETRIES + 1):
+                for retry in range(OVERFLOW_MAX_RETRIES + 1):
                     # 发给上游前把界面模型名翻译成真实 ID（如 deepseek-v4.1-flash -> deepseek-flash）
                     payload = {"model": _api_model(model, base_url), "messages": current_messages, "stream": True}
+                    # 显式给足单次输出上限：不指定时厂商按自己的默认值
+                    # （常见 4096）截断，表现就是"话说到一半突然停了"。
+                    if use_max_tokens:
+                        payload["max_tokens"] = MAX_OUTPUT_TOKENS
                     # 深度分析开关：开 = 深度思考，关 = 快速回答（显式关闭思考）
                     if provider == "deepseek":
                         payload["thinking"] = {"type": "enabled" if deep_thinking else "disabled"}
@@ -1794,8 +1967,13 @@ async def send_message(chat_id: int, request: Request):
                     if provider == "qwen":
                         payload["enable_thinking"] = deep_thinking
 
+                    # 超时语义：只卡"两次数据之间的间隔"，不卡整次请求总时长。
+                    # 用 total 的话，长回答会恰好在跑到上限那一刻被硬切断。
                     async with session.post(api_url, json=payload, headers=headers,
-                                            timeout=aiohttp.ClientTimeout(total=300)) as resp:
+                                            timeout=aiohttp.ClientTimeout(
+                                                total=None,
+                                                sock_connect=30,
+                                                sock_read=UPSTREAM_SOCK_READ_TIMEOUT)) as resp:
                         if resp.status != 200:
                             try:
                                 err_body = await resp.text()
@@ -1803,14 +1981,32 @@ async def send_message(chat_id: int, request: Request):
                             except Exception:
                                 err_text = f"HTTP {resp.status}"
 
-                            # 检测上下文溢出 → 自动缩减消息重试
-                            if _is_context_overflow(resp.status, err_text) and retry < MAX_RETRIES:
+                            # 个别厂商不接受较大的 max_tokens：去掉再试一次，
+                            # 退回它自己的默认值，总比直接给用户一个报错好。
+                            if use_max_tokens and resp.status == 400 and \
+                                    re.search(r'max_tokens|max_completion_tokens', err_text, re.I):
+                                use_max_tokens = False
+                                continue
+
+                            # 检测上下文溢出 → 先压缩、再逐步少量丢弃（尽量保住历史）
+                            if _is_context_overflow(resp.status, err_text) and retry < OVERFLOW_MAX_RETRIES:
                                 sys_msgs = [m for m in current_messages if m["role"] == "system"]
                                 non_sys = [m for m in current_messages if m["role"] != "system"]
                                 if len(non_sys) <= 2:
                                     break  # 只剩最后一条用户消息，放弃
-                                drop_count = max(1, len(non_sys) // 2)
-                                dropped_notice += f'\n⚠️ 模型上下文不足，已自动丢弃更早的 {drop_count} 条消息后重试'
+                                if not condensed_try:
+                                    # 第一轮不丢消息，只把历史压成摘要 —— 信息量损失远小于丢弃
+                                    condensed_try = True
+                                    compacted = []
+                                    for m in non_sys:
+                                        c = m.get("condensed") or _condense_text(m.get("content") or "")
+                                        compacted.append({"role": m["role"], "content": c})
+                                    dropped_notice += '\n⚠️ 模型上下文不足，已将更早内容压缩为摘要后重试'
+                                    current_messages = sys_msgs + compacted
+                                    continue  # 重试
+                                # 之后每次只丢最早的一小段（约 10%），而不是一次砍掉一半
+                                drop_count = max(1, len(non_sys) // 10)
+                                dropped_notice += f'\n⚠️ 模型上下文不足，已丢弃最早的 {drop_count} 条消息后重试'
                                 non_sys = non_sys[drop_count:]
                                 current_messages = sys_msgs + non_sys
                                 continue  # 重试
@@ -1842,6 +2038,10 @@ async def send_message(chat_id: int, request: Request):
                                     if not choices:
                                         continue
                                     delta = choices[0].get("delta", {})
+                                    # 结束原因：length 表示撞到单次输出上限被截断，
+                                    # 必须如实告诉用户，否则半截回答会被当成完整回答。
+                                    if choices[0].get("finish_reason"):
+                                        finish_reason = choices[0]["finish_reason"]
                                     content = delta.get("content", "")
                                     reasoning = delta.get("reasoning_content", "")
                                     if reasoning:
@@ -1872,6 +2072,8 @@ async def send_message(chat_id: int, request: Request):
                     # error_msg 非空 = 上游中途断流：手上只有半截内容，必须如实标注，
                     # 不能把被截断的回答当成完整回答交给用户。
                     _warn = f"\n⚠️ 回答未完整生成（{error_msg[:120]}）" if error_msg else ""
+                    if finish_reason == "length":
+                        _warn += "\n⚠️ 回答达到模型单次输出上限而被截断（可回复“继续”让它接着写）"
                     await db2.execute(
                         "UPDATE messages SET content=?, condensed=?, reasoning=?, tokens_in=?, tokens_out=?, status='done',"
                         " notice=CASE WHEN ?='' THEN notice ELSE notice || ? END WHERE id=?",
@@ -1922,6 +2124,7 @@ async def send_message(chat_id: int, request: Request):
         它与客户端连接完全无关：切屏、断线、关页面都不会让它停下来。"""
         content, reasoning, notice = "", "", ""
         last_flush = 0.0
+        cancelled = False
         gen = stream_response()
         try:
             async for line in gen:
@@ -1948,11 +2151,25 @@ async def send_message(chat_id: int, request: Request):
                     if (await _flush(content, reasoning, notice)) == "cancelled":
                         # 有 worker 收到了中止请求（经由数据库传递）：异步关闭生成器走收尾
                         await gen.aclose()
+                        cancelled = True
                         break
         except asyncio.CancelledError:
             raise
         except Exception as e:
-            await _flush(content or f"❌ 请求异常: {str(e)[:300]}", reasoning, notice, "error")
+            # 已经收到一部分内容时不要把它丢掉：判成 error 会让用户连半截都看不到。
+            # 这里保存已有内容并如实标注中断，比整条消息变成一个报错有用得多。
+            _em = f"请求异常: {str(e)[:300]}"
+            if content:
+                await _flush(content, reasoning,
+                             (notice + "\n" if notice else "") + f"⚠️ 生成中断（{_em}）", "done")
+            else:
+                await _flush(f"❌ {_em}", reasoning, notice, "error")
+        if cancelled:
+            # 用户主动中止：半截内容要带上"已中止"标记，
+            # 否则它会被当成一条完整回答留在对话里，看不出是没说完。
+            await _flush(content, reasoning,
+                         (notice + "\n" if notice else "") + "⚠️ 已手动中止，内容不完整",
+                         "done" if content else "error")
         # 兜底：确保占位行一定落到终态，否则前端会永远停在“生成中”
         _dg = await get_db()
         try:
@@ -1968,6 +2185,7 @@ async def send_message(chat_id: int, request: Request):
         yield f"data: {json.dumps({'streaming_id': msg_id})}\n\n"
         sent_c = sent_r = sent_n = 0
         idle_since = time.time()
+        last_ping = time.time()
         while True:
             d = await get_db()
             try:
@@ -1975,7 +2193,7 @@ async def send_message(chat_id: int, request: Request):
                 # 当前用户；这里再校验一次是为了防止将来重构出"按 id 订阅"的
                 # 入口时，有人拿别人的 msg_id 订阅到别人的生成内容。
                 row = await fetch_one(d,
-                    "SELECT m.content, m.reasoning, m.notice, m.status, m.tokens_in, m.tokens_out"
+                    "SELECT m.content, m.reasoning, m.notice, m.status, m.tokens_in, m.tokens_out, m.created_at"
                     " FROM messages m JOIN chats c ON c.id = m.chat_id"
                     " WHERE m.id=? AND c.user_id=?", (msg_id, user["id"]))
             finally:
@@ -2006,23 +2224,36 @@ async def send_message(chat_id: int, request: Request):
                 idle_since = time.time()
             if status != "done":
                 # streaming / cancelled：生成还在继续
-                if time.time() - idle_since > 300:
+                if time.time() - idle_since > TAIL_IDLE_TIMEOUT:
                     yield f"data: {json.dumps({'error': '生成超时（长时间无新内容），请重试'})}\n\n"
                     yield "data: [DONE]\n\n"
                     return
+                # 心跳保活：反向代理（nginx 默认 60s 无数据即断开）与浏览器空闲超时
+                # 只看"有没有字节经过"，并不看是不是正文。不发心跳的话，上游稍微
+                # 慢一点连接就被中间层悄悄切断 —— 前端表现为"话说到一半没了"，
+                # 而且没有任何报错，因为收到的是 done 而不是错误。
+                if time.time() - last_ping > SSE_PING_INTERVAL:
+                    last_ping = time.time()
+                    yield ": ping\n\n"
                 await asyncio.sleep(0.25)
                 continue
             if not content:
                 yield f"data: {json.dumps({'error': '模型未返回内容'})}\n\n"
             else:
-                yield f"data: {json.dumps({'saved_id': msg_id, 'tokens_in': row['tokens_in'] or 0, 'tokens_out': row['tokens_out'] or 0, 'window_pct': round(window_pct)})}\n\n"
+                yield f"data: {json.dumps({'saved_id': msg_id, 'tokens_in': row['tokens_in'] or 0, 'tokens_out': row['tokens_out'] or 0, 'window_pct': round(window_pct), 'created_at': row['created_at'] or 0})}\n\n"
             yield "data: [DONE]\n\n"
             return
 
     _task = asyncio.create_task(_pump())
     _BG_TASKS.add(_task)
     _task.add_done_callback(_BG_TASKS.discard)
-    return StreamingResponse(_tail(), media_type="text/event-stream")
+    # X-Accel-Buffering: no —— 让 nginx 不要把 SSE 攒在缓冲区里再一次性吐出，
+    # 否则流式会退化成"卡很久然后整段蹦出来"，中间层也更容易判定为空闲连接。
+    return StreamingResponse(
+        _tail(),
+        media_type="text/event-stream",
+        headers={"X-Accel-Buffering": "no", "Cache-Control": "no-cache, no-transform"},
+    )
 
 # ============================================================
 # 启动

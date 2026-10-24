@@ -291,6 +291,20 @@ textarea.input { resize: vertical; min-height: 60px; }
     line-height: 1.4;
     user-select: none;
 }
+/* 气泡脚注：时间 + token 统计，刻意做得很淡，不抢正文注意力 */
+.msg-foot {
+    display: flex; align-items: baseline; gap: 8px; flex-wrap: wrap;
+    font-size: 11px;
+    opacity: .45;
+    color: var(--text-secondary);
+    padding: 3px 8px 0;
+    line-height: 1.4;
+    user-select: none;
+    transition: opacity .15s;
+}
+.message:hover .msg-foot { opacity: .8; }
+.msg-foot .msg-tokens { opacity: 1; font-size: 11px; padding: 0; }
+.msg-time { white-space: nowrap; font-variant-numeric: tabular-nums; }
 /* 思考过程 */
 .msg-reasoning { margin-bottom: 4px; }
 .msg-reasoning .reasoning-bar {
@@ -346,6 +360,17 @@ textarea.input { resize: vertical; min-height: 60px; }
 .settings-header h1 { font-size: 20px; }
 .settings-section { background: var(--bg-card); border-radius: var(--radius); padding: 20px; box-shadow: var(--shadow); margin-bottom: 16px; }
 .settings-section h2 { font-size: 17px; margin-bottom: 10px; }
+/* 导出对话列表 */
+.export-item {
+    display: flex; align-items: center; justify-content: space-between; gap: 10px;
+    padding: 9px 10px; border: 1px solid var(--border); border-radius: 8px; margin-bottom: 8px;
+}
+.export-item:hover { background: #f8fafc; }
+.export-item-main { display: flex; flex-direction: column; gap: 2px; min-width: 0; }
+.export-item-title { font-size: 14px; font-weight: 500; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.export-item-meta { font-size: 12px; color: var(--text-secondary); }
+.export-dl { background: var(--primary); color: #fff; white-space: nowrap; }
+@media (max-width: 480px) { .export-item-title { white-space: normal; } }
 .settings-desc { color: var(--text-secondary); font-size: 13px; margin-bottom: 16px; }
 .key-form { display: flex; flex-direction: column; gap: 10px; margin-bottom: 16px; }
 .key-list { display: flex; flex-direction: column; gap: 8px; }

@@ -69,6 +69,19 @@
         </div>
     </div>
 
+    <div class="settings-section">
+        <h2>导出聊天记录</h2>
+        <p style="font-size:13px;color:#94a3b8;margin-bottom:10px">
+            选一个对话导出为 Markdown 文件下载。只会列出并导出<strong>你自己</strong>的对话。
+        </p>
+        <label style="display:flex;align-items:center;gap:6px;font-size:13px;color:#475569;margin-bottom:10px">
+            <input type="checkbox" id="export-reasoning"> 附带深度分析过程
+        </label>
+        <button class="btn btn-primary" onclick="toggleExportList()" id="btn-export">选择对话导出…</button>
+        <div id="export-panel" style="display:none;margin-top:12px"></div>
+        <div id="export-msg" style="font-size:13px;margin-top:8px"></div>
+    </div>
+
     <div class="settings-section" style="border:1px solid #fecaca">
         <h2 style="color:#dc2626">注销账号</h2>
         <p style="font-size:13px;color:#94a3b8;margin-bottom:8px">输入「确认注销此账号」确认</p>
@@ -87,6 +100,69 @@ let PROVIDER_INFO={},keysData={};
 
 function hasKey(pid){return !!(keysData[pid]&&keysData[pid].has_key);}
 function slotValue(n){const s=document.getElementById('provider-pick-'+n);return s?s.value:'';}
+function escHtml(s){const d=document.createElement('div');d.textContent=s;return d.innerHTML;}
+function fmtExpDate(ts){const d=new Date((Number(ts)||0)*1000),p=x=>(x<10?'0'+x:''+x);return d.getFullYear()+'-'+p(d.getMonth()+1)+'-'+p(d.getDate());}
+
+/* ===== 聊天记录导出 ===== */
+let exportChats=null;
+async function toggleExportList(){
+    const p=document.getElementById('export-panel');
+    if(p.style.display==='none'){await loadExportChats();p.style.display='block';}
+    else{p.style.display='none';}
+}
+async function loadExportChats(){
+    const p=document.getElementById('export-panel'),msg=document.getElementById('export-msg');
+    msg.textContent='';msg.style.color='';
+    p.innerHTML='<div style="font-size:13px;color:#94a3b8">加载中…</div>';
+    let list;
+    try{
+        const resp=await fetch('api/export/chats');
+        if(!resp.ok){
+            p.innerHTML='';
+            msg.style.color='#dc2626';
+            msg.textContent=((await resp.json().catch(()=>({}))).detail)||'加载失败';
+            return;
+        }
+        list=await resp.json();
+    }catch(_){
+        p.innerHTML='';msg.style.color='#dc2626';msg.textContent='网络错误';return;
+    }
+    exportChats=list;
+    if(!list.length){p.innerHTML='<div style="font-size:13px;color:#94a3b8">还没有任何对话</div>';return;}
+    p.innerHTML=list.map(c=>
+        '<div class="export-item">'+
+          '<div class="export-item-main">'+
+            '<span class="export-item-title">'+escHtml(c.title)+'</span>'+
+            '<span class="export-item-meta">'+(c.msg_count||0)+' 条消息 · '+fmtExpDate(c.updated_at)+'</span>'+
+          '</div>'+
+          '<button class="btn btn-sm export-dl" onclick="downloadChat('+c.id+')">下载</button>'+
+        '</div>'
+    ).join('');
+}
+async function downloadChat(id){
+    const msg=document.getElementById('export-msg');
+    msg.style.color='';msg.textContent='正在生成…';
+    const withR=document.getElementById('export-reasoning').checked?'1':'0';
+    try{
+        const resp=await fetch('api/export/chats/'+id+'?reasoning='+withR);
+        if(!resp.ok){
+            msg.style.color='#dc2626';
+            msg.textContent=((await resp.json().catch(()=>({}))).detail)||'导出失败';
+            return;
+        }
+        // 文件名从 Content-Disposition 里取（中文走 filename*）
+        let fn='chat.md';
+        const cd=resp.headers.get('Content-Disposition')||'';
+        const m=cd.match(/filename\*=UTF-8''([^;]+)/i);
+        if(m){try{fn=decodeURIComponent(m[1]);}catch(_){fn=m[1];}}
+        const blob=await resp.blob();
+        const url=URL.createObjectURL(blob);
+        const a=document.createElement('a');
+        a.href=url;a.download=fn;document.body.appendChild(a);a.click();a.remove();
+        setTimeout(()=>URL.revokeObjectURL(url),5000);
+        msg.style.color='#16a34a';msg.textContent='已导出：'+fn;
+    }catch(_){msg.style.color='#dc2626';msg.textContent='导出失败';}
+}
 
 function initModule(n,excludePids){
     const sel=document.getElementById('provider-pick-'+n);
